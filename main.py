@@ -4,10 +4,11 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-DATABASE_URL = os.environ["DATABASE_URL"].replace(
-    "postgresql://", "postgresql+asyncpg://"
-)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
+DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 engine = create_async_engine(DATABASE_URL, echo=True)
 
 app = FastAPI(title="ProbLabs API")
@@ -24,6 +25,8 @@ async def db_check():
         result = await conn.execute(text("SELECT 1"))
         value = result.scalar()
     return {"db": "ok", "select": value}
+
+
 @app.get("/meta")
 async def meta():
     return {
