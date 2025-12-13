@@ -24,3 +24,9 @@ async def db_check():
         result = await conn.execute(text("SELECT 1"))
         value = result.scalar()
     return {"db": "ok", "select": value}
+@app.get("/meta")
+async def meta():
+    return {
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "service": os.getenv("RENDER_SERVICE_NAME"),
+    }
