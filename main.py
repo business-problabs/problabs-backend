@@ -9,7 +9,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
 DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-engine = create_async_engine(DATABASE_URL, echo=True)
+engine = create_async_engine(DATABASE_URL, echo=False)
 
 app = FastAPI(title="ProbLabs API")
 
