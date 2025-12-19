@@ -8,6 +8,11 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+
 # --- Database setup ---
 DATABASE_URL = os.environ["DATABASE_URL"].replace(
     "postgresql://", "postgresql+asyncpg://"
@@ -36,17 +41,22 @@ TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
 
-def get_client_ip(request: Request) -> str | None:
+def get_client_ip(request: Request) -> str:
     """
     Best-effort client IP extraction behind proxies (Render / Vercel / etc.).
+    Uses X-Forwarded-For when present; falls back to FastAPI/Starlette remote address.
     """
     xff = request.headers.get("x-forwarded-for")
     if xff:
         # "client, proxy1, proxy2"
         return xff.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return None
+    return get_remote_address(request)
+
+
+# --- Rate limiting (per client IP) ---
+limiter = Limiter(key_func=get_client_ip, default_limits=[])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 async def verify_turnstile(token: str, remote_ip: str | None = None) -> None:
@@ -73,7 +83,6 @@ async def verify_turnstile(token: str, remote_ip: str | None = None) -> None:
 
     payload = resp.json()
     if not payload.get("success"):
-        # You *can* surface error-codes for debugging, but keep message simple for users.
         raise HTTPException(status_code=403, detail="Turnstile verification failed.")
 
 
@@ -113,7 +122,10 @@ async def leads_count():
     return {"ok": True, "count": total}
 
 
+# ✅ Rate limit ONLY this endpoint:
+# - default: 5 requests per minute per IP
 @app.post("/leads")
+@limiter.limit("5/minute")
 async def create_lead(payload: LeadIn, request: Request):
     """
     Verifies Turnstile server-side, normalizes email, then inserts lead.
