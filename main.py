@@ -1,9 +1,12 @@
 
 import os
+import csv
+import io
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -40,6 +43,9 @@ app.add_middleware(
 TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "").strip()
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 
+# --- Admin key (for exports) ---
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+
 
 def get_client_ip(request: Request) -> str:
     """
@@ -48,7 +54,6 @@ def get_client_ip(request: Request) -> str:
     """
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        # "client, proxy1, proxy2"
         return xff.split(",")[0].strip()
     return get_remote_address(request)
 
@@ -57,6 +62,21 @@ def get_client_ip(request: Request) -> str:
 limiter = Limiter(key_func=get_client_ip, default_limits=[])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def require_admin(request: Request) -> None:
+    """
+    Simple header-based auth for admin endpoints.
+    Send: X-Admin-Key: <ADMIN_API_KEY>
+    """
+    if not ADMIN_API_KEY:
+        # Fail closed if not configured
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not set on the server.")
+
+    provided = request.headers.get("x-admin-key") or request.headers.get("X-Admin-Key")
+    if not provided or provided.strip() != ADMIN_API_KEY:
+        # 404 is sometimes used to hide endpoint existence; 401 is clearer.
+        raise HTTPException(status_code=401, detail="Unauthorized.")
 
 
 async def verify_turnstile(token: str, remote_ip: str | None = None) -> None:
@@ -122,8 +142,7 @@ async def leads_count():
     return {"ok": True, "count": total}
 
 
-# ✅ Rate limit ONLY this endpoint:
-# - default: 5 requests per minute per IP
+# ✅ Rate limit ONLY this endpoint: 5 requests per minute per IP
 @app.post("/leads")
 @limiter.limit("5/minute")
 async def create_lead(payload: LeadIn, request: Request):
@@ -131,15 +150,11 @@ async def create_lead(payload: LeadIn, request: Request):
     Verifies Turnstile server-side, normalizes email, then inserts lead.
     Idempotent via unique constraint on email.
     """
-
-    # 1) Verify Turnstile server-side
     client_ip = get_client_ip(request)
     await verify_turnstile(payload.turnstile_token, remote_ip=client_ip)
 
-    # 2) Normalize email (backend-level)
     email = str(payload.email).strip().lower()
 
-    # 3) Insert
     async with engine.begin() as conn:
         inserted = await conn.execute(
             text(
@@ -168,3 +183,73 @@ async def create_lead(payload: LeadIn, request: Request):
             "message": "ℹ️ You’re already on the list.",
             "email": email,
         }
+
+
+# -------------------------
+# Admin export endpoints
+# -------------------------
+
+@app.get("/admin/leads")
+@limiter.limit("30/minute")
+async def admin_leads(request: Request, limit: int = 2000, offset: int = 0):
+    """
+    Returns leads as JSON (admin only).
+    """
+    require_admin(request)
+
+    # Safety caps
+    limit = max(1, min(limit, 20000))
+    offset = max(0, min(offset, 500000))
+
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                """
+                SELECT id, email, created_at
+                FROM leads
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"limit": limit, "offset": offset},
+        )
+        rows = [dict(r) for r in res.mappings().all()]
+
+    return {"ok": True, "count": len(rows), "limit": limit, "offset": offset, "leads": rows}
+
+
+@app.get("/admin/leads.csv")
+@limiter.limit("10/minute")
+async def admin_leads_csv(request: Request):
+    """
+    Downloads all leads as CSV (admin only).
+    """
+    require_admin(request)
+
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                """
+                SELECT id, email, created_at
+                FROM leads
+                ORDER BY id ASC
+                """
+            )
+        )
+        rows = res.mappings().all()
+
+    def generate():
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["id", "email", "created_at"])
+
+        for r in rows:
+            writer.writerow([r["id"], r["email"], r["created_at"]])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="problabs_leads.csv"'
+    }
+    return StreamingResponse(generate(), media_type="text/csv", headers=headers)
