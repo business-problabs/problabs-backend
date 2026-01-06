@@ -3,5 +3,5 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 requests
-pydantic
+pydantic[email]
 resend
