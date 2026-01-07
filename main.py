@@ -1,6 +1,7 @@
 import os
 import csv
 import io
+import hmac
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -20,10 +21,9 @@ app = FastAPI(title="ProbLabs Backend", version="0.1.0")
 
 
 # -------------------------------------------------
-# Environment
+# Environment (non-secret ok to cache)
 # -------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "support@problabs.net")
@@ -70,14 +70,19 @@ class LeadIn(BaseModel):
 
 
 # -------------------------------------------------
-# Admin Auth (SINGLE SOURCE OF TRUTH)
+# Admin Auth (read env at request time)
 # -------------------------------------------------
 def require_admin_key(
     x_admin_key: str = Header(default=None, alias="X-Admin-Key")
 ):
-    if not ADMIN_API_KEY:
+    # Read from env at request-time to avoid any caching/stale issues
+    server_key = (os.getenv("ADMIN_API_KEY") or "").strip()
+    client_key = (x_admin_key or "").strip()
+
+    if not server_key:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
-    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+
+    if not client_key or not hmac.compare_digest(client_key, server_key):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
