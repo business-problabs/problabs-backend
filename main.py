@@ -70,9 +70,11 @@ class LeadIn(BaseModel):
 
 
 # -------------------------------------------------
-# Auth helpers
+# Admin Auth (SINGLE SOURCE OF TRUTH)
 # -------------------------------------------------
-def require_admin_key(x_admin_key: str = Header(default=None, alias="X-Admin-Key")):
+def require_admin_key(
+    x_admin_key: str = Header(default=None, alias="X-Admin-Key")
+):
     if not ADMIN_API_KEY:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
@@ -117,7 +119,7 @@ def send_welcome_email(to_email: str):
 
 
 # -------------------------------------------------
-# Routes
+# Public Routes
 # -------------------------------------------------
 @app.get("/health")
 def health():
@@ -157,25 +159,29 @@ def create_lead(payload: LeadIn, db=Depends(get_db)):
 
     try:
         send_welcome_email(email)
-    except Exception as e:
-        # Email failure should NOT block signup
-        return {"ok": True, "email_sent": False, "error": str(e)}
+        email_sent = True
+    except Exception:
+        email_sent = False
 
-    return {"ok": True, "email_sent": True}
+    return {"ok": True, "email_sent": email_sent}
 
 
 # -------------------------------------------------
-# Admin
+# Admin Routes
 # -------------------------------------------------
 @app.get("/admin/leads", dependencies=[Depends(require_admin_key)])
 def admin_leads(db=Depends(get_db)):
-    result = db.execute(text("SELECT email, created_at FROM leads ORDER BY created_at DESC"))
+    result = db.execute(
+        text("SELECT email, created_at FROM leads ORDER BY created_at DESC")
+    )
     return [{"email": r[0], "created_at": r[1]} for r in result.fetchall()]
 
 
 @app.get("/admin/leads.csv", dependencies=[Depends(require_admin_key)])
 def admin_leads_csv(db=Depends(get_db)):
-    result = db.execute(text("SELECT email, created_at FROM leads ORDER BY created_at DESC"))
+    result = db.execute(
+        text("SELECT email, created_at FROM leads ORDER BY created_at DESC")
+    )
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
@@ -194,17 +200,13 @@ def admin_leads_csv(db=Depends(get_db)):
 
 
 # -------------------------------------------------
-# Debug (protected)
+# Debug (Protected)
 # -------------------------------------------------
-@app.get("/_debug/test-email")
-def debug_test_email(
-    x_admin_key: str = Header(default=None, alias="X-Admin-Key")
-):
-    if x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+@app.get("/_debug/test-email", dependencies=[Depends(require_admin_key)])
+def debug_test_email():
     if not TEST_TO_EMAIL:
         raise HTTPException(status_code=500, detail="TEST_TO_EMAIL not set")
 
     result = send_welcome_email(TEST_TO_EMAIL)
     return {"ok": True, "sent_to": TEST_TO_EMAIL, "result": result}
+
