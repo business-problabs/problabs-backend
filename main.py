@@ -22,7 +22,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.4")
+app = FastAPI(title="ProbLabs Backend", version="0.1.5")
 
 
 # -------------------------------------------------
@@ -100,8 +100,6 @@ def get_db():
 # -------------------------------------------------
 class LeadIn(BaseModel):
     email: EmailStr
-    # Frontend must send Turnstile token here.
-    # Example JSON: {"email":"a@b.com", "turnstile_token":"<token>"}
     turnstile_token: Optional[str] = None
 
 
@@ -147,18 +145,10 @@ def rate_limit_leads(request: Request):
 # Turnstile verification (backend)
 # -------------------------------------------------
 def verify_turnstile(token: str, remoteip: Optional[str] = None) -> dict:
-    """
-    Verifies a Cloudflare Turnstile token server-side.
-    Uses stdlib urllib to avoid adding dependencies.
-    Returns the parsed verification response dict.
-    """
     if not TURNSTILE_SECRET_KEY:
         raise RuntimeError("TURNSTILE_SECRET_KEY not configured")
 
-    data = {
-        "secret": TURNSTILE_SECRET_KEY,
-        "response": token,
-    }
+    data = {"secret": TURNSTILE_SECRET_KEY, "response": token}
     if remoteip:
         data["remoteip"] = remoteip
 
@@ -183,11 +173,6 @@ def verify_turnstile(token: str, remoteip: Optional[str] = None) -> dict:
 # Email helpers
 # -------------------------------------------------
 def build_from_header(email_from_value: str) -> str:
-    """
-    Robust FROM:
-    - If EMAIL_FROM already looks like 'Name <email@x.com>', use it as-is.
-    - Else wrap: 'ProbLabs <email>'.
-    """
     v = (email_from_value or "").strip()
     if "<" in v and ">" in v:
         return v
@@ -195,10 +180,6 @@ def build_from_header(email_from_value: str) -> str:
 
 
 def _resend_send(payload: dict):
-    """
-    Support multiple resend python library shapes (they've varied).
-    Tries a couple common call patterns.
-    """
     if not RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY not configured")
 
@@ -206,7 +187,6 @@ def _resend_send(payload: dict):
 
     if hasattr(resend, "Emails") and hasattr(resend.Emails, "send"):
         return resend.Emails.send(payload)
-
     if hasattr(resend, "emails") and hasattr(resend.emails, "send"):
         return resend.emails.send(payload)
 
@@ -256,7 +236,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.4"}
+    return {"service": "ProbLabs Backend", "version": "0.1.5"}
 
 
 @app.get("/db-check")
@@ -279,16 +259,8 @@ def create_lead(
     _=Depends(rate_limit_leads),
     x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
 ):
-    """
-    Public signup endpoint.
-    Security:
-      - Rate limited (per-instance)
-      - Turnstile verified server-side (prevents direct bot POSTs)
-      - Optional admin-key bypass for manual curl testing
-    """
     email = payload.email.lower().strip()
 
-    # Turnstile verification unless admin bypass is provided
     if not is_valid_admin_key(x_admin_key):
         token = (payload.turnstile_token or "").strip()
         if not token:
@@ -299,7 +271,6 @@ def create_lead(
 
         remoteip = request.client.host if request.client else None
         result = verify_turnstile(token=token, remoteip=remoteip)
-
         if not result.get("success", False):
             raise HTTPException(
                 status_code=403,
@@ -309,7 +280,6 @@ def create_lead(
                 },
             )
 
-    # Insert only if new; RETURNING lets us detect whether it inserted
     result = db.execute(
         text(
             """
@@ -344,7 +314,7 @@ def create_lead(
 
 
 # -------------------------------------------------
-# Admin Routes (optionally hidden prefix)
+# Admin Routes
 # -------------------------------------------------
 @app.get(f"/{ADMIN_PATH}/leads", dependencies=[Depends(require_admin_key)])
 def admin_leads(db=Depends(get_db)):
@@ -374,15 +344,14 @@ def admin_leads_csv(db=Depends(get_db)):
 @app.get(f"/{ADMIN_PATH}/stats", dependencies=[Depends(require_admin_key)])
 def admin_stats(db=Depends(get_db)):
     """
-    Daily signup counts for the last 30 days (UTC-ish), including days with 0 signups.
-    Uses simple SQL + Python fill to avoid generate_series dependency.
+    Daily signup counts for the last 30 days, plus quick rollups.
     """
     try:
         days = 30
         end_day: date = datetime.utcnow().date()
         start_day: date = end_day - timedelta(days=days - 1)
 
-        # Query counts for days that exist
+        # Pull counts for existing days (UTC-ish)
         q = text(
             """
             SELECT CAST(created_at AS date) AS day, COUNT(*)::int AS cnt
@@ -394,11 +363,11 @@ def admin_stats(db=Depends(get_db)):
         )
         start_ts = datetime.combine(start_day, datetime.min.time())
         rows = db.execute(q, {"start_ts": start_ts}).fetchall()
-
         by_day = {str(r[0]): int(r[1]) for r in rows}
 
         daily = []
         total_30d = 0
+
         for i in range(days):
             d = start_day + timedelta(days=i)
             key = str(d)
@@ -408,12 +377,32 @@ def admin_stats(db=Depends(get_db)):
 
         total_all = int(db.execute(text("SELECT COUNT(*) FROM leads")).scalar())
 
+        # Rollups
+        today_key = str(end_day)
+        yesterday_key = str(end_day - timedelta(days=1))
+        today_count = int(by_day.get(today_key, 0))
+        yesterday_count = int(by_day.get(yesterday_key, 0))
+
+        last_7d_start = end_day - timedelta(days=6)
+        last_7d_total = 0
+        for i in range(7):
+            d = last_7d_start + timedelta(days=i)
+            last_7d_total += int(by_day.get(str(d), 0))
+
+        avg_7d_per_day = last_7d_total / 7.0
+        avg_30d_per_day = total_30d / float(days)
+
         return {
             "range_days": days,
             "start_date": str(start_day),
             "end_date": str(end_day),
             "total_30d": int(total_30d),
             "total_all": int(total_all),
+            "today_count": int(today_count),
+            "yesterday_count": int(yesterday_count),
+            "last_7d_total": int(last_7d_total),
+            "avg_7d_per_day": avg_7d_per_day,
+            "avg_30d_per_day": avg_30d_per_day,
             "daily": daily,
         }
 
@@ -422,10 +411,7 @@ def admin_stats(db=Depends(get_db)):
         print("ADMIN STATS ERROR:\n", tb)
         raise HTTPException(
             status_code=500,
-            detail={
-                "error": str(e),
-                "hint": "Stats query failed. Check DB dialect and leads.created_at type.",
-            },
+            detail={"error": str(e), "hint": "Stats query failed."},
         )
 
 
@@ -441,14 +427,11 @@ if ENABLE_DEBUG_ENDPOINTS:
         try:
             result = send_welcome_email(TEST_TO_EMAIL)
             return {"ok": True, "sent_to": TEST_TO_EMAIL, "result": result}
-        except Exception as e:
+        except Exception:
             tb = traceback.format_exc()
             print("EMAIL DEBUG ERROR:\n", tb)
             raise HTTPException(
                 status_code=500,
-                detail={
-                    "error": str(e),
-                    "hint": "Check RESEND_API_KEY, verified sender domain, and EMAIL_FROM.",
-                },
+                detail={"error": "Email send failed. Check logs."},
             )
 
