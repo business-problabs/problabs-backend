@@ -5,7 +5,7 @@ import time
 import json
 import traceback
 from datetime import datetime, timedelta, date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
 from urllib.parse import urlencode
 
@@ -22,7 +22,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.5")
+app = FastAPI(title="ProbLabs Backend", version="0.1.6")
 
 
 # -------------------------------------------------
@@ -35,7 +35,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 
-EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")  # ideally raw email
+EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "support@problabs.net")
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "https://problabs.net")
 
@@ -53,12 +53,15 @@ TURNSTILE_VERIFY_URL = os.getenv(
 )
 
 # Optional: hide admin routes behind a non-obvious prefix.
-# Default stays "admin" so nothing breaks unless you set it.
 ADMIN_PATH = os.getenv("ADMIN_PATH", "admin").strip().strip("/")
 
 # Simple, dependency-free rate limit (per instance)
 LEADS_RL_MAX = int(os.getenv("LEADS_RL_MAX", "5"))
 LEADS_RL_WINDOW_SEC = int(os.getenv("LEADS_RL_WINDOW_SEC", "60"))
+
+# Nurture emails
+ENABLE_NURTURE_EMAILS = os.getenv("ENABLE_NURTURE_EMAILS", "false").lower() == "true"
+NURTURE_BATCH_LIMIT = int(os.getenv("NURTURE_BATCH_LIMIT", "25"))
 
 
 # -------------------------------------------------
@@ -93,6 +96,26 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_email_events_table(db) -> None:
+    """
+    Ensures email_events table exists. Safe to run multiple times.
+    """
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS email_events (
+              id SERIAL PRIMARY KEY,
+              email TEXT NOT NULL,
+              event_type TEXT NOT NULL, -- welcome | day3 | day7
+              sent_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              UNIQUE (email, event_type)
+            );
+            """
+        )
+    )
+    db.commit()
 
 
 # -------------------------------------------------
@@ -193,6 +216,23 @@ def _resend_send(payload: dict):
     raise RuntimeError("Unsupported resend library version: cannot find send method")
 
 
+def _record_email_event(db, email: str, event_type: str) -> None:
+    """
+    Record that an email was sent. Deduped by UNIQUE(email,event_type).
+    """
+    db.execute(
+        text(
+            """
+            INSERT INTO email_events (email, event_type, sent_at)
+            VALUES (:email, :event_type, NOW())
+            ON CONFLICT (email, event_type) DO NOTHING;
+            """
+        ),
+        {"email": email, "event_type": event_type},
+    )
+    db.commit()
+
+
 def send_welcome_email(to_email: str):
     html = f"""
     <h1>Welcome to ProbLabs 🎯</h1>
@@ -226,6 +266,172 @@ def send_welcome_email(to_email: str):
     return _resend_send(payload)
 
 
+def send_day3_email(to_email: str):
+    subject = "How ProbLabs analyzes Florida lottery data"
+    html = f"""
+    <h2>How ProbLabs Works</h2>
+
+    <p>You signed up for ProbLabs because you play Florida daily lottery games.</p>
+
+    <p>Here’s what we actually do (and what we don’t):</p>
+
+    <ul>
+      <li>We analyze historical Florida Lottery data for games like Fantasy 5, Pick 3, Pick 4, and Cash Pop.</li>
+      <li>We look for frequency patterns, timing behaviors, and distribution shifts over time.</li>
+      <li>We do <strong>not</strong> claim to predict guaranteed winning numbers.</li>
+    </ul>
+
+    <p>ProbLabs is about <strong>better awareness</strong>, not false promises.</p>
+
+    <p>
+      Bookmark us:
+      <a href="{PUBLIC_APP_URL}">{PUBLIC_APP_URL}</a>
+    </p>
+
+    <p>– The ProbLabs Team</p>
+    """
+
+    payload = {
+        "from": build_from_header(EMAIL_FROM),
+        "to": [to_email],
+        "reply_to": EMAIL_REPLY_TO,
+        "subject": subject,
+        "html": html,
+    }
+    return _resend_send(payload)
+
+
+def send_day7_email(to_email: str):
+    subject = "Why ProbLabs focuses on data, not hype"
+    html = f"""
+    <h2>Why You Can Trust ProbLabs</h2>
+
+    <p>Most lottery-related content online is built for clicks, not accuracy.</p>
+
+    <p>ProbLabs takes a different approach:</p>
+
+    <ul>
+      <li>We focus on Florida daily games only.</li>
+      <li>We work with real historical draw data.</li>
+      <li>We avoid sensational claims and guarantees.</li>
+    </ul>
+
+    <p>Lottery games are random — but player behavior and number distributions over time can still be studied.</p>
+
+    <p>
+      Thanks for being an early supporter.<br />
+      – The ProbLabs Team
+    </p>
+
+    <p>
+      Visit:
+      <a href="{PUBLIC_APP_URL}">{PUBLIC_APP_URL}</a>
+    </p>
+    """
+
+    payload = {
+        "from": build_from_header(EMAIL_FROM),
+        "to": [to_email],
+        "reply_to": EMAIL_REPLY_TO,
+        "subject": subject,
+        "html": html,
+    }
+    return _resend_send(payload)
+
+
+def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[List[str], List[str]]:
+    """
+    Returns (day3_emails, day7_emails) that are due and not yet sent.
+    Uses email_events to dedupe.
+    """
+    ensure_email_events_table(db)
+
+    day3_cutoff = now_utc - timedelta(days=3)
+    day7_cutoff = now_utc - timedelta(days=7)
+
+    # Due for Day 7
+    day7_rows = db.execute(
+        text(
+            """
+            SELECT l.email
+            FROM leads l
+            LEFT JOIN email_events e
+              ON e.email = l.email AND e.event_type = 'day7'
+            WHERE l.created_at <= :cutoff
+              AND e.email IS NULL
+            ORDER BY l.created_at ASC
+            LIMIT :lim;
+            """
+        ),
+        {"cutoff": day7_cutoff, "lim": batch_limit},
+    ).fetchall()
+    day7_emails = [r[0] for r in day7_rows]
+
+    # Due for Day 3 (exclude anyone already sent day3)
+    day3_rows = db.execute(
+        text(
+            """
+            SELECT l.email
+            FROM leads l
+            LEFT JOIN email_events e
+              ON e.email = l.email AND e.event_type = 'day3'
+            WHERE l.created_at <= :cutoff
+              AND e.email IS NULL
+            ORDER BY l.created_at ASC
+            LIMIT :lim;
+            """
+        ),
+        {"cutoff": day3_cutoff, "lim": batch_limit},
+    ).fetchall()
+    day3_emails = [r[0] for r in day3_rows]
+
+    return day3_emails, day7_emails
+
+
+def process_nurture_emails(db) -> dict:
+    """
+    Sends due nurture emails (day3/day7). Never raises outward.
+    Returns a small summary for admin visibility.
+    """
+    if not ENABLE_NURTURE_EMAILS:
+        return {"enabled": False, "sent_day3": 0, "sent_day7": 0, "errors": 0}
+
+    now_utc = datetime.utcnow()
+
+    sent_day3 = 0
+    sent_day7 = 0
+    errors = 0
+
+    try:
+        day3_emails, day7_emails = _get_due_nurture_emails(db, now_utc, NURTURE_BATCH_LIMIT)
+
+        # Send Day 7 first (older cohort first)
+        for email in day7_emails:
+            try:
+                send_day7_email(email)
+                _record_email_event(db, email=email, event_type="day7")
+                sent_day7 += 1
+            except Exception:
+                errors += 1
+                print("NURETURE DAY7 ERROR:\n", traceback.format_exc())
+
+        # Then Day 3
+        for email in day3_emails:
+            try:
+                send_day3_email(email)
+                _record_email_event(db, email=email, event_type="day3")
+                sent_day3 += 1
+            except Exception:
+                errors += 1
+                print("NURETURE DAY3 ERROR:\n", traceback.format_exc())
+
+    except Exception:
+        errors += 1
+        print("NURETURE PROCESS ERROR:\n", traceback.format_exc())
+
+    return {"enabled": True, "sent_day3": sent_day3, "sent_day7": sent_day7, "errors": errors}
+
+
 # -------------------------------------------------
 # Public Routes
 # -------------------------------------------------
@@ -236,7 +442,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.5"}
+    return {"service": "ProbLabs Backend", "version": "0.1.6"}
 
 
 @app.get("/db-check")
@@ -301,6 +507,11 @@ def create_lead(
         try:
             send_welcome_email(email)
             email_sent = True
+
+            # Track welcome send (deduped)
+            ensure_email_events_table(db)
+            _record_email_event(db, email=email, event_type="welcome")
+
         except Exception as e:
             email_sent = False
             email_error = str(e)
@@ -344,14 +555,14 @@ def admin_leads_csv(db=Depends(get_db)):
 @app.get(f"/{ADMIN_PATH}/stats", dependencies=[Depends(require_admin_key)])
 def admin_stats(db=Depends(get_db)):
     """
-    Daily signup counts for the last 30 days, plus quick rollups.
+    Daily signup counts for the last 30 days, plus rollups.
+    Also triggers nurture email processing (safe, kill-switchable).
     """
     try:
         days = 30
         end_day: date = datetime.utcnow().date()
         start_day: date = end_day - timedelta(days=days - 1)
 
-        # Pull counts for existing days (UTC-ish)
         q = text(
             """
             SELECT CAST(created_at AS date) AS day, COUNT(*)::int AS cnt
@@ -367,7 +578,6 @@ def admin_stats(db=Depends(get_db)):
 
         daily = []
         total_30d = 0
-
         for i in range(days):
             d = start_day + timedelta(days=i)
             key = str(d)
@@ -377,7 +587,6 @@ def admin_stats(db=Depends(get_db)):
 
         total_all = int(db.execute(text("SELECT COUNT(*) FROM leads")).scalar())
 
-        # Rollups
         today_key = str(end_day)
         yesterday_key = str(end_day - timedelta(days=1))
         today_count = int(by_day.get(today_key, 0))
@@ -392,6 +601,9 @@ def admin_stats(db=Depends(get_db)):
         avg_7d_per_day = last_7d_total / 7.0
         avg_30d_per_day = total_30d / float(days)
 
+        # Trigger nurture processing (never breaks stats)
+        nurture_summary = process_nurture_emails(db)
+
         return {
             "range_days": days,
             "start_date": str(start_day),
@@ -404,15 +616,13 @@ def admin_stats(db=Depends(get_db)):
             "avg_7d_per_day": avg_7d_per_day,
             "avg_30d_per_day": avg_30d_per_day,
             "daily": daily,
+            "nurture": nurture_summary,
         }
 
     except Exception as e:
         tb = traceback.format_exc()
         print("ADMIN STATS ERROR:\n", tb)
-        raise HTTPException(
-            status_code=500,
-            detail={"error": str(e), "hint": "Stats query failed."},
-        )
+        raise HTTPException(status_code=500, detail={"error": str(e), "hint": "Stats failed. Check logs."})
 
 
 # -------------------------------------------------
@@ -428,10 +638,6 @@ if ENABLE_DEBUG_ENDPOINTS:
             result = send_welcome_email(TEST_TO_EMAIL)
             return {"ok": True, "sent_to": TEST_TO_EMAIL, "result": result}
         except Exception:
-            tb = traceback.format_exc()
-            print("EMAIL DEBUG ERROR:\n", tb)
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "Email send failed. Check logs."},
-            )
+            print("EMAIL DEBUG ERROR:\n", traceback.format_exc())
+            raise HTTPException(status_code=500, detail={"error": "Email send failed. Check logs."})
 
