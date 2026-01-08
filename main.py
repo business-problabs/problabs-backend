@@ -2,9 +2,12 @@ import os
 import csv
 import io
 import time
+import json
 import traceback
 from datetime import datetime
 from typing import Dict, List, Optional
+from urllib import request as urlrequest
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -19,7 +22,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.1")
+app = FastAPI(title="ProbLabs Backend", version="0.1.2")
 
 
 # -------------------------------------------------
@@ -32,18 +35,28 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 
-EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")  # should be the raw email address
+EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")  # ideally raw email
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "support@problabs.net")
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "https://problabs.net")
-
-TEST_TO_EMAIL = os.getenv("TEST_TO_EMAIL")
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
+TEST_TO_EMAIL = os.getenv("TEST_TO_EMAIL")
+
+# Turnstile
+TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY")
+TURNSTILE_VERIFY_URL = os.getenv(
+    "TURNSTILE_VERIFY_URL",
+    "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+)
+
+# Optional: hide admin routes behind a non-obvious prefix.
+# Default stays "admin" so nothing breaks unless you set it.
+ADMIN_PATH = os.getenv("ADMIN_PATH", "admin").strip().strip("/")
+
 # Simple, dependency-free rate limit (per instance)
-# Defaults: 5 requests/minute per IP for POST /leads
 LEADS_RL_MAX = int(os.getenv("LEADS_RL_MAX", "5"))
 LEADS_RL_WINDOW_SEC = int(os.getenv("LEADS_RL_WINDOW_SEC", "60"))
 
@@ -87,6 +100,9 @@ def get_db():
 # -------------------------------------------------
 class LeadIn(BaseModel):
     email: EmailStr
+    # Frontend must send Turnstile token here.
+    # Example JSON: {"email":"a@b.com", "turnstile_token":"<token>"}
+    turnstile_token: Optional[str] = None
 
 
 # -------------------------------------------------
@@ -97,6 +113,10 @@ def require_admin_key(x_admin_key: str = Header(default=None, alias="X-Admin-Key
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def is_valid_admin_key(x_admin_key: Optional[str]) -> bool:
+    return bool(ADMIN_API_KEY and x_admin_key and x_admin_key == ADMIN_API_KEY)
 
 
 # -------------------------------------------------
@@ -124,13 +144,49 @@ def rate_limit_leads(request: Request):
 
 
 # -------------------------------------------------
+# Turnstile verification (backend)
+# -------------------------------------------------
+def verify_turnstile(token: str, remoteip: Optional[str] = None) -> dict:
+    """
+    Verifies a Cloudflare Turnstile token server-side.
+    Uses stdlib urllib to avoid adding dependencies.
+    Returns the parsed verification response dict.
+    """
+    if not TURNSTILE_SECRET_KEY:
+        raise RuntimeError("TURNSTILE_SECRET_KEY not configured")
+
+    data = {
+        "secret": TURNSTILE_SECRET_KEY,
+        "response": token,
+    }
+    if remoteip:
+        data["remoteip"] = remoteip
+
+    body = urlencode(data).encode("utf-8")
+    req = urlrequest.Request(
+        TURNSTILE_VERIFY_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+
+    with urlrequest.urlopen(req, timeout=10) as resp:
+        raw = resp.read().decode("utf-8")
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"success": False, "error-codes": ["invalid-json"], "raw": raw}
+
+
+# -------------------------------------------------
 # Email helpers
 # -------------------------------------------------
 def build_from_header(email_from_value: str) -> str:
     """
-    Make FROM robust:
-    - If EMAIL_FROM is already in 'Name <email@x.com>' format, use it as-is.
-    - If it's only an email, wrap it as 'ProbLabs <email>'.
+    Robust FROM:
+    - If EMAIL_FROM already looks like 'Name <email@x.com>', use it as-is.
+    - Else wrap: 'ProbLabs <email>'.
     """
     v = (email_from_value or "").strip()
     if "<" in v and ">" in v:
@@ -200,7 +256,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.1"}
+    return {"service": "ProbLabs Backend", "version": "0.1.2"}
 
 
 @app.get("/db-check")
@@ -216,9 +272,45 @@ def leads_count(db=Depends(get_db)):
 
 
 @app.post("/leads")
-def create_lead(payload: LeadIn, request: Request, db=Depends(get_db), _=Depends(rate_limit_leads)):
+def create_lead(
+    payload: LeadIn,
+    request: Request,
+    db=Depends(get_db),
+    _=Depends(rate_limit_leads),
+    x_admin_key: Optional[str] = Header(default=None, alias="X-Admin-Key"),
+):
+    """
+    Public signup endpoint.
+    Security:
+      - Rate limited (per-instance)
+      - Turnstile verified server-side (prevents direct bot POSTs)
+      - Optional admin-key bypass for manual curl testing
+    """
     email = payload.email.lower().strip()
 
+    # Turnstile verification unless admin bypass is provided
+    if not is_valid_admin_key(x_admin_key):
+        token = (payload.turnstile_token or "").strip()
+        if not token:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing turnstile_token. Please complete the verification and try again.",
+            )
+
+        remoteip = request.client.host if request.client else None
+        result = verify_turnstile(token=token, remoteip=remoteip)
+
+        if not result.get("success", False):
+            # Avoid leaking too much detail, but include error codes for debugging
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "message": "Turnstile verification failed.",
+                    "error_codes": result.get("error-codes") or result.get("error_codes"),
+                },
+            )
+
+    # Insert only if new; RETURNING lets us detect whether it inserted
     result = db.execute(
         text(
             """
@@ -253,15 +345,15 @@ def create_lead(payload: LeadIn, request: Request, db=Depends(get_db), _=Depends
 
 
 # -------------------------------------------------
-# Admin Routes
+# Admin Routes (optionally hidden prefix)
 # -------------------------------------------------
-@app.get("/admin/leads", dependencies=[Depends(require_admin_key)])
+@app.get(f"/{ADMIN_PATH}/leads", dependencies=[Depends(require_admin_key)])
 def admin_leads(db=Depends(get_db)):
     result = db.execute(text("SELECT email, created_at FROM leads ORDER BY created_at DESC"))
     return [{"email": r[0], "created_at": r[1]} for r in result.fetchall()]
 
 
-@app.get("/admin/leads.csv", dependencies=[Depends(require_admin_key)])
+@app.get(f"/{ADMIN_PATH}/leads.csv", dependencies=[Depends(require_admin_key)])
 def admin_leads_csv(db=Depends(get_db)):
     result = db.execute(text("SELECT email, created_at FROM leads ORDER BY created_at DESC"))
     rows = result.fetchall()
@@ -292,7 +384,7 @@ if ENABLE_DEBUG_ENDPOINTS:
         Security hardening:
         - Only exists when ENABLE_DEBUG_ENDPOINTS=true
         - Still requires X-Admin-Key
-        - Returns a minimal error to the caller (full traceback only in logs)
+        - Returns minimal error to caller (traceback only in logs)
         """
         if not TEST_TO_EMAIL:
             raise HTTPException(status_code=500, detail="TEST_TO_EMAIL not set")
