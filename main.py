@@ -4,7 +4,7 @@ import io
 import time
 import json
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional
 from urllib import request as urlrequest
 from urllib.parse import urlencode
@@ -22,7 +22,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.3")
+app = FastAPI(title="ProbLabs Backend", version="0.1.4")
 
 
 # -------------------------------------------------
@@ -256,7 +256,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.3"}
+    return {"service": "ProbLabs Backend", "version": "0.1.4"}
 
 
 @app.get("/db-check")
@@ -301,7 +301,6 @@ def create_lead(
         result = verify_turnstile(token=token, remoteip=remoteip)
 
         if not result.get("success", False):
-            # Avoid leaking too much detail, but include error codes for debugging
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -375,44 +374,59 @@ def admin_leads_csv(db=Depends(get_db)):
 @app.get(f"/{ADMIN_PATH}/stats", dependencies=[Depends(require_admin_key)])
 def admin_stats(db=Depends(get_db)):
     """
-    Daily signup counts for the last 30 days (UTC), including days with 0 signups.
+    Daily signup counts for the last 30 days (UTC-ish), including days with 0 signups.
+    Uses simple SQL + Python fill to avoid generate_series dependency.
     """
-    days = 30
-    start_dt = datetime.utcnow().date() - timedelta(days=days - 1)
-    # Use Postgres generate_series to fill in missing days with 0
-    q = text(
-        """
-        WITH days AS (
-          SELECT generate_series(:start_date::date, CURRENT_DATE::date, interval '1 day')::date AS day
-        ),
-        counts AS (
-          SELECT created_at::date AS day, COUNT(*)::int AS cnt
-          FROM leads
-          WHERE created_at >= (:start_date::date)
-          GROUP BY 1
+    try:
+        days = 30
+        end_day: date = datetime.utcnow().date()
+        start_day: date = end_day - timedelta(days=days - 1)
+
+        # Query counts for days that exist
+        q = text(
+            """
+            SELECT CAST(created_at AS date) AS day, COUNT(*)::int AS cnt
+            FROM leads
+            WHERE created_at >= :start_ts
+            GROUP BY 1
+            ORDER BY 1 ASC;
+            """
         )
-        SELECT d.day, COALESCE(c.cnt, 0) AS count
-        FROM days d
-        LEFT JOIN counts c ON c.day = d.day
-        ORDER BY d.day ASC;
-        """
-    )
+        start_ts = datetime.combine(start_day, datetime.min.time())
+        rows = db.execute(q, {"start_ts": start_ts}).fetchall()
 
-    rows = db.execute(q, {"start_date": str(start_dt)}).fetchall()
+        by_day = {str(r[0]): int(r[1]) for r in rows}
 
-    series = [{"date": str(r[0]), "count": int(r[1])} for r in rows]
-    total_30d = sum(item["count"] for item in series)
+        daily = []
+        total_30d = 0
+        for i in range(days):
+            d = start_day + timedelta(days=i)
+            key = str(d)
+            c = int(by_day.get(key, 0))
+            total_30d += c
+            daily.append({"date": key, "count": c})
 
-    total_all = db.execute(text("SELECT COUNT(*) FROM leads")).scalar()
+        total_all = int(db.execute(text("SELECT COUNT(*) FROM leads")).scalar())
 
-    return {
-        "range_days": days,
-        "start_date": str(start_dt),
-        "end_date": str(datetime.utcnow().date()),
-        "total_30d": int(total_30d),
-        "total_all": int(total_all),
-        "daily": series,
-    }
+        return {
+            "range_days": days,
+            "start_date": str(start_day),
+            "end_date": str(end_day),
+            "total_30d": int(total_30d),
+            "total_all": int(total_all),
+            "daily": daily,
+        }
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("ADMIN STATS ERROR:\n", tb)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "hint": "Stats query failed. Check DB dialect and leads.created_at type.",
+            },
+        )
 
 
 # -------------------------------------------------
@@ -421,14 +435,6 @@ def admin_stats(db=Depends(get_db)):
 if ENABLE_DEBUG_ENDPOINTS:
     @app.get("/_debug/test-email", dependencies=[Depends(require_admin_key)])
     def debug_test_email():
-        """
-        Sends a test welcome email to TEST_TO_EMAIL.
-
-        Security hardening:
-        - Only exists when ENABLE_DEBUG_ENDPOINTS=true
-        - Still requires X-Admin-Key
-        - Returns minimal error to caller (traceback only in logs)
-        """
         if not TEST_TO_EMAIL:
             raise HTTPException(status_code=500, detail="TEST_TO_EMAIL not set")
 
