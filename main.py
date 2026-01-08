@@ -4,7 +4,7 @@ import io
 import time
 import traceback
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -19,17 +19,20 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.0")
+app = FastAPI(title="ProbLabs Backend", version="0.1.1")
 
 
 # -------------------------------------------------
 # Environment
 # -------------------------------------------------
+ENV = os.getenv("ENV", "production").lower()
+ENABLE_DEBUG_ENDPOINTS = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").lower() == "true"
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 
-EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")  # should be the raw email address
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "support@problabs.net")
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "https://problabs.net")
 
@@ -49,7 +52,6 @@ LEADS_RL_WINDOW_SEC = int(os.getenv("LEADS_RL_WINDOW_SEC", "60"))
 # Basic validations
 # -------------------------------------------------
 if not DATABASE_URL:
-    # Fail fast so Render logs show an obvious configuration error
     raise RuntimeError("DATABASE_URL not configured")
 
 
@@ -90,9 +92,7 @@ class LeadIn(BaseModel):
 # -------------------------------------------------
 # Admin Auth
 # -------------------------------------------------
-def require_admin_key(
-    x_admin_key: str = Header(default=None, alias="X-Admin-Key")
-):
+def require_admin_key(x_admin_key: str = Header(default=None, alias="X-Admin-Key")):
     if not ADMIN_API_KEY:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
@@ -102,8 +102,6 @@ def require_admin_key(
 # -------------------------------------------------
 # Rate Limiting (simple, per-instance)
 # -------------------------------------------------
-# NOTE: This is in-memory and resets on deploy / restart.
-# It's still useful to prevent basic spam + protect Resend during bursts.
 _ip_hits: Dict[str, List[float]] = {}
 
 
@@ -113,7 +111,6 @@ def rate_limit_leads(request: Request):
     window_start = now - LEADS_RL_WINDOW_SEC
 
     hits = _ip_hits.get(ip, [])
-    # keep only hits in window
     hits = [t for t in hits if t >= window_start]
 
     if len(hits) >= LEADS_RL_MAX:
@@ -127,22 +124,30 @@ def rate_limit_leads(request: Request):
 
 
 # -------------------------------------------------
-# Email
+# Email helpers
 # -------------------------------------------------
+def build_from_header(email_from_value: str) -> str:
+    """
+    Make FROM robust:
+    - If EMAIL_FROM is already in 'Name <email@x.com>' format, use it as-is.
+    - If it's only an email, wrap it as 'ProbLabs <email>'.
+    """
+    v = (email_from_value or "").strip()
+    if "<" in v and ">" in v:
+        return v
+    return f"ProbLabs <{v}>"
+
+
 def _resend_send(payload: dict):
     """
     Support multiple resend python library shapes (they've varied).
     Tries a couple common call patterns.
     """
-    # Ensure API key is set at send-time as well
     if not RESEND_API_KEY:
         raise RuntimeError("RESEND_API_KEY not configured")
 
     resend.api_key = RESEND_API_KEY
 
-    # Common patterns:
-    # - resend.Emails.send({...})
-    # - resend.emails.send({...})
     if hasattr(resend, "Emails") and hasattr(resend.Emails, "send"):
         return resend.Emails.send(payload)
 
@@ -175,8 +180,8 @@ def send_welcome_email(to_email: str):
     """
 
     payload = {
-        "from": f"ProbLabs <{EMAIL_FROM}>",
-        "to": to_email,  # resend accepts string or list depending on version; string works in many versions
+        "from": build_from_header(EMAIL_FROM),
+        "to": [to_email],
         "reply_to": EMAIL_REPLY_TO,
         "subject": "Welcome to ProbLabs 🎯 You’re on the waitlist",
         "html": html,
@@ -190,12 +195,12 @@ def send_welcome_email(to_email: str):
 # -------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "env": ENV, "time": datetime.utcnow().isoformat()}
 
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.0"}
+    return {"service": "ProbLabs Backend", "version": "0.1.1"}
 
 
 @app.get("/db-check")
@@ -214,19 +219,18 @@ def leads_count(db=Depends(get_db)):
 def create_lead(payload: LeadIn, request: Request, db=Depends(get_db), _=Depends(rate_limit_leads)):
     email = payload.email.lower().strip()
 
-    # Insert only if new; RETURNING lets us detect whether it inserted
     result = db.execute(
-        text("""
+        text(
+            """
             INSERT INTO leads (email, created_at)
             VALUES (:email, NOW())
             ON CONFLICT (email) DO NOTHING
             RETURNING email
-        """),
+            """
+        ),
         {"email": email},
     )
-    inserted_row = result.fetchone()
-    inserted = inserted_row is not None
-
+    inserted = result.fetchone() is not None
     db.commit()
 
     email_sent = False
@@ -237,15 +241,14 @@ def create_lead(payload: LeadIn, request: Request, db=Depends(get_db), _=Depends
             send_welcome_email(email)
             email_sent = True
         except Exception as e:
-            # Don't fail lead capture if email fails — just report status.
             email_sent = False
             email_error = str(e)
 
     return {
         "ok": True,
-        "inserted": inserted,          # tells frontend whether it was new
-        "email_sent": email_sent,      # only true when inserted + send succeeded
-        "email_error": email_error,    # helps debugging without breaking signup
+        "inserted": inserted,
+        "email_sent": email_sent,
+        "email_error": email_error,
     }
 
 
@@ -254,9 +257,7 @@ def create_lead(payload: LeadIn, request: Request, db=Depends(get_db), _=Depends
 # -------------------------------------------------
 @app.get("/admin/leads", dependencies=[Depends(require_admin_key)])
 def admin_leads(db=Depends(get_db)):
-    result = db.execute(
-        text("SELECT email, created_at FROM leads ORDER BY created_at DESC")
-    )
+    result = db.execute(text("SELECT email, created_at FROM leads ORDER BY created_at DESC"))
     return [{"email": r[0], "created_at": r[1]} for r in result.fetchall()]
 
 
@@ -280,30 +281,33 @@ def admin_leads_csv(db=Depends(get_db)):
 
 
 # -------------------------------------------------
-# Debug (Protected)
+# Debug (Admin + explicitly enabled)
 # -------------------------------------------------
-@app.get("/_debug/test-email", dependencies=[Depends(require_admin_key)])
-def debug_test_email():
-    """
-    Sends a test welcome email to TEST_TO_EMAIL and returns detailed errors
-    (instead of a generic Internal Server Error).
-    """
-    if not TEST_TO_EMAIL:
-        raise HTTPException(status_code=500, detail="TEST_TO_EMAIL not set")
+if ENABLE_DEBUG_ENDPOINTS:
+    @app.get("/_debug/test-email", dependencies=[Depends(require_admin_key)])
+    def debug_test_email():
+        """
+        Sends a test welcome email to TEST_TO_EMAIL.
 
-    try:
-        result = send_welcome_email(TEST_TO_EMAIL)
-        return {"ok": True, "sent_to": TEST_TO_EMAIL, "result": result}
-    except Exception as e:
-        tb = traceback.format_exc()
-        # Render will show this in logs, and API caller gets a clear message.
-        print("EMAIL DEBUG ERROR:\n", tb)
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": str(e),
-                "hint": "Check RESEND_API_KEY, verified sender domain, and EMAIL_FROM.",
-                "trace": tb,
-            },
-        )
+        Security hardening:
+        - Only exists when ENABLE_DEBUG_ENDPOINTS=true
+        - Still requires X-Admin-Key
+        - Returns a minimal error to the caller (full traceback only in logs)
+        """
+        if not TEST_TO_EMAIL:
+            raise HTTPException(status_code=500, detail="TEST_TO_EMAIL not set")
+
+        try:
+            result = send_welcome_email(TEST_TO_EMAIL)
+            return {"ok": True, "sent_to": TEST_TO_EMAIL, "result": result}
+        except Exception as e:
+            tb = traceback.format_exc()
+            print("EMAIL DEBUG ERROR:\n", tb)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": str(e),
+                    "hint": "Check RESEND_API_KEY, verified sender domain, and EMAIL_FROM.",
+                },
+            )
 
