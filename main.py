@@ -4,7 +4,7 @@ import io
 import time
 import json
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib import request as urlrequest
 from urllib.parse import urlencode
@@ -22,7 +22,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.2")
+app = FastAPI(title="ProbLabs Backend", version="0.1.3")
 
 
 # -------------------------------------------------
@@ -256,7 +256,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.2"}
+    return {"service": "ProbLabs Backend", "version": "0.1.3"}
 
 
 @app.get("/db-check")
@@ -370,6 +370,49 @@ def admin_leads_csv(db=Depends(get_db)):
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=leads.csv"},
     )
+
+
+@app.get(f"/{ADMIN_PATH}/stats", dependencies=[Depends(require_admin_key)])
+def admin_stats(db=Depends(get_db)):
+    """
+    Daily signup counts for the last 30 days (UTC), including days with 0 signups.
+    """
+    days = 30
+    start_dt = datetime.utcnow().date() - timedelta(days=days - 1)
+    # Use Postgres generate_series to fill in missing days with 0
+    q = text(
+        """
+        WITH days AS (
+          SELECT generate_series(:start_date::date, CURRENT_DATE::date, interval '1 day')::date AS day
+        ),
+        counts AS (
+          SELECT created_at::date AS day, COUNT(*)::int AS cnt
+          FROM leads
+          WHERE created_at >= (:start_date::date)
+          GROUP BY 1
+        )
+        SELECT d.day, COALESCE(c.cnt, 0) AS count
+        FROM days d
+        LEFT JOIN counts c ON c.day = d.day
+        ORDER BY d.day ASC;
+        """
+    )
+
+    rows = db.execute(q, {"start_date": str(start_dt)}).fetchall()
+
+    series = [{"date": str(r[0]), "count": int(r[1])} for r in rows]
+    total_30d = sum(item["count"] for item in series)
+
+    total_all = db.execute(text("SELECT COUNT(*) FROM leads")).scalar()
+
+    return {
+        "range_days": days,
+        "start_date": str(start_dt),
+        "end_date": str(datetime.utcnow().date()),
+        "total_30d": int(total_30d),
+        "total_all": int(total_all),
+        "daily": series,
+    }
 
 
 # -------------------------------------------------
