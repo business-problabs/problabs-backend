@@ -22,7 +22,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.6")
+app = FastAPI(title="ProbLabs Backend", version="0.1.7")
 
 
 # -------------------------------------------------
@@ -62,6 +62,7 @@ LEADS_RL_WINDOW_SEC = int(os.getenv("LEADS_RL_WINDOW_SEC", "60"))
 # Nurture emails
 ENABLE_NURTURE_EMAILS = os.getenv("ENABLE_NURTURE_EMAILS", "false").lower() == "true"
 NURTURE_BATCH_LIMIT = int(os.getenv("NURTURE_BATCH_LIMIT", "25"))
+NURTURE_SEND_DELAY_SEC = float(os.getenv("NURTURE_SEND_DELAY_SEC", "0.6"))
 
 
 # -------------------------------------------------
@@ -367,7 +368,7 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[Li
     ).fetchall()
     day7_emails = [r[0] for r in day7_rows]
 
-    # Due for Day 3 (exclude anyone already sent day3)
+    # Due for Day 3
     day3_rows = db.execute(
         text(
             """
@@ -390,8 +391,11 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[Li
 
 def process_nurture_emails(db) -> dict:
     """
-    Sends due nurture emails (day3/day7). Never raises outward.
-    Returns a small summary for admin visibility.
+    Sends due nurture emails (day3/day7).
+    - Uses event dedupe (email_events)
+    - Adds pacing to avoid Resend rate-limits
+    - Stops early if a rate-limit error is detected
+    Never raises outward.
     """
     if not ENABLE_NURTURE_EMAILS:
         return {"enabled": False, "sent_day3": 0, "sent_day7": 0, "errors": 0}
@@ -401,9 +405,19 @@ def process_nurture_emails(db) -> dict:
     sent_day3 = 0
     sent_day7 = 0
     errors = 0
+    stopped_early = False
+    stop_reason = None
 
     try:
         day3_emails, day7_emails = _get_due_nurture_emails(db, now_utc, NURTURE_BATCH_LIMIT)
+
+        def _maybe_sleep():
+            if NURTURE_SEND_DELAY_SEC > 0:
+                time.sleep(NURTURE_SEND_DELAY_SEC)
+
+        def _is_rate_limit_error(exc: Exception) -> bool:
+            msg = str(exc).lower()
+            return ("too many requests" in msg) or ("rate limit" in msg) or ("429" in msg)
 
         # Send Day 7 first (older cohort first)
         for email in day7_emails:
@@ -411,25 +425,42 @@ def process_nurture_emails(db) -> dict:
                 send_day7_email(email)
                 _record_email_event(db, email=email, event_type="day7")
                 sent_day7 += 1
-            except Exception:
+            except Exception as e:
                 errors += 1
-                print("NURETURE DAY7 ERROR:\n", traceback.format_exc())
+                print("NURTURE DAY7 ERROR:\n", traceback.format_exc())
+                if _is_rate_limit_error(e):
+                    stopped_early = True
+                    stop_reason = "rate_limited_day7"
+                    break
+            finally:
+                _maybe_sleep()
 
-        # Then Day 3
-        for email in day3_emails:
-            try:
-                send_day3_email(email)
-                _record_email_event(db, email=email, event_type="day3")
-                sent_day3 += 1
-            except Exception:
-                errors += 1
-                print("NURETURE DAY3 ERROR:\n", traceback.format_exc())
+        # Then Day 3 (only if we didn't stop early)
+        if not stopped_early:
+            for email in day3_emails:
+                try:
+                    send_day3_email(email)
+                    _record_email_event(db, email=email, event_type="day3")
+                    sent_day3 += 1
+                except Exception as e:
+                    errors += 1
+                    print("NURTURE DAY3 ERROR:\n", traceback.format_exc())
+                    if _is_rate_limit_error(e):
+                        stopped_early = True
+                        stop_reason = "rate_limited_day3"
+                        break
+                finally:
+                    _maybe_sleep()
 
     except Exception:
         errors += 1
-        print("NURETURE PROCESS ERROR:\n", traceback.format_exc())
+        print("NURTURE PROCESS ERROR:\n", traceback.format_exc())
 
-    return {"enabled": True, "sent_day3": sent_day3, "sent_day7": sent_day7, "errors": errors}
+    out = {"enabled": True, "sent_day3": sent_day3, "sent_day7": sent_day7, "errors": errors}
+    if stopped_early:
+        out["stopped_early"] = True
+        out["stop_reason"] = stop_reason
+    return out
 
 
 # -------------------------------------------------
@@ -442,7 +473,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.6"}
+    return {"service": "ProbLabs Backend", "version": "0.1.7"}
 
 
 @app.get("/db-check")
@@ -467,6 +498,7 @@ def create_lead(
 ):
     email = payload.email.lower().strip()
 
+    # Turnstile required unless admin
     if not is_valid_admin_key(x_admin_key):
         token = (payload.turnstile_token or "").strip()
         if not token:
@@ -556,7 +588,7 @@ def admin_leads_csv(db=Depends(get_db)):
 def admin_stats(db=Depends(get_db)):
     """
     Daily signup counts for the last 30 days, plus rollups.
-    Also triggers nurture email processing (safe, kill-switchable).
+    IMPORTANT: This endpoint NO LONGER sends nurture emails.
     """
     try:
         days = 30
@@ -601,9 +633,6 @@ def admin_stats(db=Depends(get_db)):
         avg_7d_per_day = last_7d_total / 7.0
         avg_30d_per_day = total_30d / float(days)
 
-        # Trigger nurture processing (never breaks stats)
-        nurture_summary = process_nurture_emails(db)
-
         return {
             "range_days": days,
             "start_date": str(start_day),
@@ -616,13 +645,22 @@ def admin_stats(db=Depends(get_db)):
             "avg_7d_per_day": avg_7d_per_day,
             "avg_30d_per_day": avg_30d_per_day,
             "daily": daily,
-            "nurture": nurture_summary,
         }
 
     except Exception as e:
         tb = traceback.format_exc()
         print("ADMIN STATS ERROR:\n", tb)
         raise HTTPException(status_code=500, detail={"error": str(e), "hint": "Stats failed. Check logs."})
+
+
+@app.post(f"/{ADMIN_PATH}/nurture/run", dependencies=[Depends(require_admin_key)])
+def admin_nurture_run(db=Depends(get_db)):
+    """
+    Manually trigger nurture emails.
+    This prevents accidental sends from /stats or the frontend stats viewer.
+    """
+    summary = process_nurture_emails(db)
+    return {"ok": True, "nurture": summary}
 
 
 # -------------------------------------------------
