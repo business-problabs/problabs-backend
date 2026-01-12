@@ -3,14 +3,16 @@ import csv
 import io
 import time
 import json
+import hmac
+import hashlib
 import traceback
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, text
@@ -22,7 +24,7 @@ import resend
 # -------------------------------------------------
 # App
 # -------------------------------------------------
-app = FastAPI(title="ProbLabs Backend", version="0.1.7")
+app = FastAPI(title="ProbLabs Backend", version="0.1.8")
 
 
 # -------------------------------------------------
@@ -35,9 +37,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 
+# Brand / Email identity
 EMAIL_FROM = os.getenv("EMAIL_FROM", "support@problabs.net")
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "support@problabs.net")
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "https://problabs.net")
+
+# Backend base for unsubscribe links (no frontend needed)
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://problabs-backend.onrender.com")
+
+# Unsubscribe signing secret (recommended!)
+# Generate a random long value and set it in Render.
+UNSUBSCRIBE_SECRET = os.getenv("UNSUBSCRIBE_SECRET", "")
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 if RESEND_API_KEY:
@@ -119,6 +129,47 @@ def ensure_email_events_table(db) -> None:
     db.commit()
 
 
+def ensure_email_unsubscribes_table(db) -> None:
+    """
+    Track unsubscribed emails. Safe to run multiple times.
+    """
+    db.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS email_unsubscribes (
+              email TEXT PRIMARY KEY,
+              unsubscribed_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+    )
+    db.commit()
+
+
+def is_unsubscribed(db, email: str) -> bool:
+    ensure_email_unsubscribes_table(db)
+    row = db.execute(
+        text("SELECT email FROM email_unsubscribes WHERE email = :email"),
+        {"email": email},
+    ).fetchone()
+    return row is not None
+
+
+def mark_unsubscribed(db, email: str) -> None:
+    ensure_email_unsubscribes_table(db)
+    db.execute(
+        text(
+            """
+            INSERT INTO email_unsubscribes (email, unsubscribed_at)
+            VALUES (:email, NOW())
+            ON CONFLICT (email) DO NOTHING;
+            """
+        ),
+        {"email": email},
+    )
+    db.commit()
+
+
 # -------------------------------------------------
 # Models
 # -------------------------------------------------
@@ -194,6 +245,38 @@ def verify_turnstile(token: str, remoteip: Optional[str] = None) -> dict:
 
 
 # -------------------------------------------------
+# Unsubscribe helpers
+# -------------------------------------------------
+def _unsub_sig(email: str) -> str:
+    """
+    HMAC signature for unsubscribe links.
+    If UNSUBSCRIBE_SECRET is missing, returns empty string.
+    """
+    if not UNSUBSCRIBE_SECRET:
+        return ""
+    msg = email.strip().lower().encode("utf-8")
+    key = UNSUBSCRIBE_SECRET.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def build_unsubscribe_url(email: str) -> Optional[str]:
+    """
+    Returns a signed unsubscribe URL, or None if UNSUBSCRIBE_SECRET is not set.
+    """
+    sig = _unsub_sig(email)
+    if not sig:
+        return None
+    base = BACKEND_PUBLIC_URL.rstrip("/")
+    return f"{base}/unsubscribe?email={quote_plus(email)}&sig={sig}"
+
+
+def build_preferences_mailto() -> str:
+    subj = quote_plus("ProbLabs email preferences")
+    body = quote_plus("Hi Probability AI Labs,\n\nPlease help me update my email preferences.\n\nThanks,")
+    return f"mailto:{EMAIL_REPLY_TO}?subject={subj}&body={body}"
+
+
+# -------------------------------------------------
 # Email helpers
 # -------------------------------------------------
 def build_from_header(email_from_value: str) -> str:
@@ -218,9 +301,6 @@ def _resend_send(payload: dict):
 
 
 def _record_email_event(db, email: str, event_type: str) -> None:
-    """
-    Record that an email was sent. Deduped by UNIQUE(email,event_type).
-    """
     db.execute(
         text(
             """
@@ -234,62 +314,112 @@ def _record_email_event(db, email: str, event_type: str) -> None:
     db.commit()
 
 
-def send_welcome_email(to_email: str):
-    html = f"""
-    <h1>Welcome to ProbLabs 🎯</h1>
-    <p>You’re on the waitlist ✅</p>
+def _email_footer_html(email: str) -> str:
+    """
+    Footer goes at the very bottom of every email.
+    Includes: preferences + unsubscribe (signed) + 1-line disclaimer.
+    """
+    prefs = build_preferences_mailto()
+    unsub_url = build_unsubscribe_url(email)
 
-    <h3>What to expect:</h3>
+    unsub_html = (
+        f'<a href="{unsub_url}">Unsubscribe</a>'
+        if unsub_url
+        else f'Email us to unsubscribe: <a href="mailto:{EMAIL_REPLY_TO}?subject=Unsubscribe">{EMAIL_REPLY_TO}</a>'
+    )
+
+    return f"""
+    <hr style="border:none;border-top:1px solid #eee;margin:24px 0;" />
+    <p style="font-size:12px;color:#777;margin:0 0 6px 0;">
+      Preferences: <a href="{prefs}">Update email preferences</a> &nbsp;|&nbsp; {unsub_html}
+    </p>
+    <p style="font-size:12px;color:#777;margin-top:10px;">
+      Probability AI Labs provides analytical and educational information only and does not guarantee lottery outcomes.
+    </p>
+    """
+
+
+def send_welcome_email(to_email: str):
+    # Professional + trustworthy, aligned with Probability AI Labs
+    html = f"""
+    <h1>Welcome to ProbLabs</h1>
+
+    <p>
+      Thanks for joining the waitlist. ProbLabs is developed by <strong>Probability AI Labs</strong>,
+      focused on Florida Lottery daily games.
+    </p>
+
+    <p>
+      We build tools and insights grounded in mathematical analysis of historical draw data—designed to provide clearer
+      context for regular players.
+    </p>
+
+    <h3>What to expect</h3>
     <ul>
-        <li>Florida Lottery insights (Fantasy 5, Pick 3, Pick 4, Cash Pop)</li>
-        <li>Data-driven patterns and trend tracking</li>
-        <li>Early access when we open the first tier</li>
+      <li>Florida-only focus: Fantasy 5, Pick 3, Pick 4, and Cash Pop</li>
+      <li>Clear analytics (frequency, distribution, trends) without hype or guarantees</li>
+      <li>Early access as we release the first tier</li>
     </ul>
 
     <p>
-        Bookmark us:
-        <a href="{PUBLIC_APP_URL}">{PUBLIC_APP_URL}</a>
+      Visit anytime: <a href="{PUBLIC_APP_URL}">{PUBLIC_APP_URL}</a>
     </p>
 
-    <p style="color:#666;font-size:12px">
-        If you didn’t sign up, you can ignore this email.
-    </p>
+    {_email_footer_html(to_email)}
     """
 
     payload = {
         "from": build_from_header(EMAIL_FROM),
         "to": [to_email],
         "reply_to": EMAIL_REPLY_TO,
-        "subject": "Welcome to ProbLabs 🎯 You’re on the waitlist",
+        "subject": "Welcome to ProbLabs — You’re on the waitlist",
         "html": html,
     }
-
     return _resend_send(payload)
 
 
 def send_day3_email(to_email: str):
-    subject = "How ProbLabs analyzes Florida lottery data"
+    subject = "How Probability AI Labs analyzes Florida lottery data"
     html = f"""
-    <h2>How ProbLabs Works</h2>
-
-    <p>You signed up for ProbLabs because you play Florida daily lottery games.</p>
-
-    <p>Here’s what we actually do (and what we don’t):</p>
-
-    <ul>
-      <li>We analyze historical Florida Lottery data for games like Fantasy 5, Pick 3, Pick 4, and Cash Pop.</li>
-      <li>We look for frequency patterns, timing behaviors, and distribution shifts over time.</li>
-      <li>We do <strong>not</strong> claim to predict guaranteed winning numbers.</li>
-    </ul>
-
-    <p>ProbLabs is about <strong>better awareness</strong>, not false promises.</p>
+    <h2>How Probability AI Labs Works</h2>
 
     <p>
-      Bookmark us:
+      You joined ProbLabs, developed by <strong>Probability AI Labs</strong>, because you play Florida Lottery daily games
+      and want insight grounded in data—not hype.
+    </p>
+
+    <p>
+      Probability AI Labs focuses on mathematically calculated analysis of historical lottery data.
+      Our goal is to help players better understand patterns, distributions, and trends that emerge over time.
+    </p>
+
+    <p>Here’s what our analysis includes:</p>
+    <ul>
+      <li>Mathematical evaluation of historical Florida Lottery data</li>
+      <li>Frequency and distribution analysis across Fantasy 5, Pick 3, Pick 4, and Cash Pop</li>
+      <li>Timing and trend observations based on long-term draw behavior</li>
+    </ul>
+
+    <p>Equally important, here’s what we do not claim:</p>
+    <ul>
+      <li>No guaranteed outcomes</li>
+      <li>No promises of winning numbers</li>
+      <li>No reliance on superstition or numerology</li>
+    </ul>
+
+    <p>
+      Lottery draws are random, but the data surrounding those draws can still be examined mathematically.
+      That analytical approach is the foundation of Probability AI Labs.
+    </p>
+
+    <p>
+      Visit us anytime:<br />
       <a href="{PUBLIC_APP_URL}">{PUBLIC_APP_URL}</a>
     </p>
 
-    <p>– The ProbLabs Team</p>
+    <p>– Probability AI Labs</p>
+
+    {_email_footer_html(to_email)}
     """
 
     payload = {
@@ -303,31 +433,39 @@ def send_day3_email(to_email: str):
 
 
 def send_day7_email(to_email: str):
-    subject = "Why ProbLabs focuses on data, not hype"
+    subject = "Why Probability AI Labs focuses on mathematics, not hype"
     html = f"""
-    <h2>Why You Can Trust ProbLabs</h2>
+    <h2>Why You Can Trust Probability AI Labs</h2>
 
-    <p>Most lottery-related content online is built for clicks, not accuracy.</p>
-
-    <p>ProbLabs takes a different approach:</p>
+    <p>
+      Much of the lottery-related content online is designed to attract attention rather than provide clarity.
+      Probability AI Labs was built to take a more disciplined approach.
+    </p>
 
     <ul>
-      <li>We focus on Florida daily games only.</li>
-      <li>We work with real historical draw data.</li>
-      <li>We avoid sensational claims and guarantees.</li>
+      <li>We focus exclusively on Florida Lottery daily games</li>
+      <li>We work with verified historical draw data</li>
+      <li>We apply mathematical analysis to study distributions and trends over time</li>
     </ul>
 
-    <p>Lottery games are random — but player behavior and number distributions over time can still be studied.</p>
-
     <p>
-      Thanks for being an early supporter.<br />
-      – The ProbLabs Team
+      While lottery outcomes are random, probability theory and statistical analysis can still provide meaningful context—
+      especially for players who participate consistently.
     </p>
 
     <p>
-      Visit:
+      We do not guarantee outcomes. We develop tools and insights that help users understand the data behind the games
+      they choose to play.
+    </p>
+
+    <p>
+      Visit us anytime:<br />
       <a href="{PUBLIC_APP_URL}">{PUBLIC_APP_URL}</a>
     </p>
+
+    <p>– Probability AI Labs</p>
+
+    {_email_footer_html(to_email)}
     """
 
     payload = {
@@ -340,17 +478,17 @@ def send_day7_email(to_email: str):
     return _resend_send(payload)
 
 
+# -------------------------------------------------
+# Nurture scheduler helpers
+# -------------------------------------------------
 def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[List[str], List[str]]:
-    """
-    Returns (day3_emails, day7_emails) that are due and not yet sent.
-    Uses email_events to dedupe.
-    """
     ensure_email_events_table(db)
+    ensure_email_unsubscribes_table(db)
 
     day3_cutoff = now_utc - timedelta(days=3)
     day7_cutoff = now_utc - timedelta(days=7)
 
-    # Due for Day 7
+    # Due for Day 7 (exclude unsubscribed)
     day7_rows = db.execute(
         text(
             """
@@ -358,8 +496,11 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[Li
             FROM leads l
             LEFT JOIN email_events e
               ON e.email = l.email AND e.event_type = 'day7'
+            LEFT JOIN email_unsubscribes u
+              ON u.email = l.email
             WHERE l.created_at <= :cutoff
               AND e.email IS NULL
+              AND u.email IS NULL
             ORDER BY l.created_at ASC
             LIMIT :lim;
             """
@@ -368,7 +509,7 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[Li
     ).fetchall()
     day7_emails = [r[0] for r in day7_rows]
 
-    # Due for Day 3
+    # Due for Day 3 (exclude unsubscribed)
     day3_rows = db.execute(
         text(
             """
@@ -376,8 +517,11 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[Li
             FROM leads l
             LEFT JOIN email_events e
               ON e.email = l.email AND e.event_type = 'day3'
+            LEFT JOIN email_unsubscribes u
+              ON u.email = l.email
             WHERE l.created_at <= :cutoff
               AND e.email IS NULL
+              AND u.email IS NULL
             ORDER BY l.created_at ASC
             LIMIT :lim;
             """
@@ -390,13 +534,6 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[Li
 
 
 def process_nurture_emails(db) -> dict:
-    """
-    Sends due nurture emails (day3/day7).
-    - Uses event dedupe (email_events)
-    - Adds pacing to avoid Resend rate-limits
-    - Stops early if a rate-limit error is detected
-    Never raises outward.
-    """
     if not ENABLE_NURTURE_EMAILS:
         return {"enabled": False, "sent_day3": 0, "sent_day7": 0, "errors": 0}
 
@@ -408,18 +545,18 @@ def process_nurture_emails(db) -> dict:
     stopped_early = False
     stop_reason = None
 
+    def _maybe_sleep():
+        if NURTURE_SEND_DELAY_SEC > 0:
+            time.sleep(NURTURE_SEND_DELAY_SEC)
+
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return ("too many requests" in msg) or ("rate limit" in msg) or ("429" in msg)
+
     try:
         day3_emails, day7_emails = _get_due_nurture_emails(db, now_utc, NURTURE_BATCH_LIMIT)
 
-        def _maybe_sleep():
-            if NURTURE_SEND_DELAY_SEC > 0:
-                time.sleep(NURTURE_SEND_DELAY_SEC)
-
-        def _is_rate_limit_error(exc: Exception) -> bool:
-            msg = str(exc).lower()
-            return ("too many requests" in msg) or ("rate limit" in msg) or ("429" in msg)
-
-        # Send Day 7 first (older cohort first)
+        # Send Day 7 first
         for email in day7_emails:
             try:
                 send_day7_email(email)
@@ -435,7 +572,6 @@ def process_nurture_emails(db) -> dict:
             finally:
                 _maybe_sleep()
 
-        # Then Day 3 (only if we didn't stop early)
         if not stopped_early:
             for email in day3_emails:
                 try:
@@ -473,7 +609,7 @@ def health():
 
 @app.get("/meta")
 def meta():
-    return {"service": "ProbLabs Backend", "version": "0.1.7"}
+    return {"service": "ProbLabs Backend", "version": "0.1.8"}
 
 
 @app.get("/db-check")
@@ -486,6 +622,33 @@ def db_check(db=Depends(get_db)):
 def leads_count(db=Depends(get_db)):
     result = db.execute(text("SELECT COUNT(*) FROM leads"))
     return {"count": result.scalar()}
+
+
+@app.get("/unsubscribe", response_class=HTMLResponse)
+def unsubscribe(email: str, sig: str, db=Depends(get_db)):
+    """
+    Unsubscribe endpoint used by email footer.
+    Requires a valid HMAC signature to prevent abuse.
+    """
+    em = (email or "").strip().lower()
+    if not em:
+        raise HTTPException(status_code=400, detail="Missing email")
+
+    expected = _unsub_sig(em)
+    if not expected or not hmac.compare_digest(expected, (sig or "").strip().lower()):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    mark_unsubscribed(db, em)
+
+    return f"""
+    <html>
+      <body style="font-family:system-ui; padding:24px;">
+        <h2>Unsubscribed</h2>
+        <p><strong>{em}</strong> has been unsubscribed from Probability AI Labs emails.</p>
+        <p style="color:#666; font-size:13px;">If this was a mistake, reply to the last email you received and we’ll help.</p>
+      </body>
+    </html>
+    """
 
 
 @app.post("/leads")
@@ -534,25 +697,30 @@ def create_lead(
 
     email_sent = False
     email_error: Optional[str] = None
+    skipped_unsubscribed = False
 
     if inserted:
-        try:
-            send_welcome_email(email)
-            email_sent = True
+        # If unsubscribed, do not send any emails.
+        if is_unsubscribed(db, email):
+            skipped_unsubscribed = True
+        else:
+            try:
+                send_welcome_email(email)
+                email_sent = True
 
-            # Track welcome send (deduped)
-            ensure_email_events_table(db)
-            _record_email_event(db, email=email, event_type="welcome")
+                ensure_email_events_table(db)
+                _record_email_event(db, email=email, event_type="welcome")
 
-        except Exception as e:
-            email_sent = False
-            email_error = str(e)
+            except Exception as e:
+                email_sent = False
+                email_error = str(e)
 
     return {
         "ok": True,
         "inserted": inserted,
         "email_sent": email_sent,
         "email_error": email_error,
+        "skipped_unsubscribed": skipped_unsubscribed,
     }
 
 
@@ -587,8 +755,7 @@ def admin_leads_csv(db=Depends(get_db)):
 @app.get(f"/{ADMIN_PATH}/stats", dependencies=[Depends(require_admin_key)])
 def admin_stats(db=Depends(get_db)):
     """
-    Daily signup counts for the last 30 days, plus rollups.
-    IMPORTANT: This endpoint NO LONGER sends nurture emails.
+    Stats only. No email sending here.
     """
     try:
         days = 30
@@ -656,8 +823,7 @@ def admin_stats(db=Depends(get_db)):
 @app.post(f"/{ADMIN_PATH}/nurture/run", dependencies=[Depends(require_admin_key)])
 def admin_nurture_run(db=Depends(get_db)):
     """
-    Manually trigger nurture emails.
-    This prevents accidental sends from /stats or the frontend stats viewer.
+    Manual nurture trigger to prevent accidental sends.
     """
     summary = process_nurture_emails(db)
     return {"ok": True, "nurture": summary}
