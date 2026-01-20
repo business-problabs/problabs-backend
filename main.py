@@ -31,6 +31,12 @@ EMAIL_FROM = os.getenv("EMAIL_FROM", "Probability AI Labs <welcome@problabs.net>
 EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "support@problabs.net")
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "https://www.problabs.net")
 
+# Full-logo (with text) for emails (absolute URL)
+EMAIL_LOGO_URL = os.getenv(
+    "EMAIL_LOGO_URL",
+    "https://www.problabs.net/branding/logo-probability-ai-labs.png",
+)
+
 ENABLE_NURTURE_EMAILS = os.getenv("ENABLE_NURTURE_EMAILS", "false").lower() == "true"
 NURTURE_BATCH_LIMIT = int(os.getenv("NURTURE_BATCH_LIMIT", "100"))
 
@@ -141,6 +147,20 @@ def _resend_send(payload: dict):
     raise RuntimeError("Unsupported resend library version")
 
 
+def _email_header_logo_html() -> str:
+    # Full logo header (email-safe HTML + absolute URL)
+    return f"""
+    <div style="margin:0 0 16px 0;">
+      <img
+        src="{EMAIL_LOGO_URL}"
+        alt="Probability AI Labs"
+        width="360"
+        style="display:block;max-width:100%;height:auto;margin:0 0 16px 0;"
+      />
+    </div>
+    """
+
+
 # -------------------------------------------------
 # Email footer (UPDATED DISCLAIMER)
 # -------------------------------------------------
@@ -171,6 +191,7 @@ def _email_footer_html(email: str) -> str:
 # -------------------------------------------------
 def send_welcome_email(to_email: str):
     html = f"""
+    {_email_header_logo_html()}
     <h1>Welcome to ProbLabs</h1>
     <p>Thanks for joining the waitlist for <strong>Probability AI Labs</strong>.</p>
     <p>Florida-only analytics. No hype. No guarantees.</p>
@@ -223,9 +244,11 @@ def create_lead(payload: dict, request: Request, db=Depends(get_db)):
 @app.get(f"/{ADMIN_PATH}/leads.csv", dependencies=[Depends(require_admin)])
 def export_leads_csv(db=Depends(get_db)):
     rows = db.execute(text("SELECT email, created_at FROM leads ORDER BY created_at DESC"))
+
     def gen():
         yield "email,created_at\n"
         for r in rows:
             yield f"{r.email},{r.created_at}\n"
+
     return StreamingResponse(gen(), media_type="text/csv")
 
