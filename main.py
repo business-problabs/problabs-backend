@@ -9,6 +9,7 @@ import httpx
 import resend
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
@@ -90,6 +91,23 @@ class EmailUnsubscribe(Base):
 # App
 # =================================================
 app = FastAPI(title="ProbLabs Backend", version="0.1.8")
+
+# ✅ CORS (Fixes browser preflight OPTIONS returning 405)
+# Add any production domains you use here.
+CORS_ORIGINS = [
+    "https://www.problabs.net",
+    "https://problabs.net",
+    # If you ever use Vercel preview domains, you can add them explicitly.
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],   # includes OPTIONS (preflight)
+    allow_headers=["*"],   # includes content-type
+    expose_headers=["Content-Disposition"],
+)
 
 
 def get_db():
@@ -406,7 +424,7 @@ def _get_due_nurture_emails(
         {"cutoff": day7_cutoff, "lim": batch_limit},
     ).fetchall()
 
-    # Day 3 due (not already day3, not unsubscribed)
+    # Day 3 due
     day3_rows = db.execute(
         text(
             """
@@ -494,24 +512,6 @@ def create_lead(payload: dict, request: Request, db=Depends(get_db)):
     if not verify_turnstile(token, ip):
         raise HTTPException(status_code=400, detail="Verification failed")
 
-    # Basic per-IP per-day rate limit (optional, simple)
-    try:
-        today = utcnow().date()
-        row = db.execute(
-            text(
-                """
-                SELECT COUNT(*) AS c
-                FROM leads
-                WHERE created_at >= :start
-                """
-            ),
-            {"start": datetime(today.year, today.month, today.day, tzinfo=timezone.utc)},
-        ).fetchone()
-        # This is a crude global count; if you want per-IP tracking, add a table.
-        # Keeping it simple to avoid schema change.
-    except Exception:
-        pass
-
     existing = db.query(Lead).filter(Lead.email == email).first()
     if existing:
         return {"ok": True, "inserted": False, "message": "You’re already on the waitlist."}
@@ -524,7 +524,7 @@ def create_lead(payload: dict, request: Request, db=Depends(get_db)):
         send_welcome_email(email)
         record_email_event(db, email, "welcome")
     except Exception:
-        # Do not fail lead capture if email fails; log via response
+        # Do not fail lead capture if email fails
         return {"ok": True, "inserted": True, "email_sent": False, "email_error": "welcome send failed"}
 
     return {"ok": True, "inserted": True, "email_sent": True, "email_error": None}
@@ -628,7 +628,6 @@ def unsubscribe(email: str, sig: str, db=Depends(get_db)):
         db.add(EmailUnsubscribe(email=email_norm))
         db.commit()
 
-    # Simple confirmation response (frontend can also provide a nicer page)
     return JSONResponse(
         {
             "ok": True,
