@@ -296,4 +296,88 @@ def send_day7_email(to_email: str):
 # Nurture + Routes (unchanged)
 # =================================================
 # (rest of file continues exactly as before)
+# =================================================
+# Nurture logic + admin routes (RESTORED)
+# =================================================
+from fastapi import Depends
+
+
+def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int):
+    day3_cutoff = now_utc - timedelta(days=3)
+    day7_cutoff = now_utc - timedelta(days=7)
+
+    day3_rows = db.execute(
+        text("""
+        SELECT l.email
+        FROM leads l
+        LEFT JOIN email_events e
+          ON e.email = l.email AND e.event_type = 'day3'
+        LEFT JOIN email_unsubscribes u
+          ON u.email = l.email
+        WHERE l.created_at <= :cutoff
+          AND e.id IS NULL
+          AND u.email IS NULL
+        ORDER BY l.created_at
+        LIMIT :lim
+        """),
+        {"cutoff": day3_cutoff, "lim": batch_limit},
+    ).fetchall()
+
+    day7_rows = db.execute(
+        text("""
+        SELECT l.email
+        FROM leads l
+        LEFT JOIN email_events e
+          ON e.email = l.email AND e.event_type = 'day7'
+        LEFT JOIN email_unsubscribes u
+          ON u.email = l.email
+        WHERE l.created_at <= :cutoff
+          AND e.id IS NULL
+          AND u.email IS NULL
+        ORDER BY l.created_at
+        LIMIT :lim
+        """),
+        {"cutoff": day7_cutoff, "lim": batch_limit},
+    ).fetchall()
+
+    return [r[0] for r in day3_rows], [r[0] for r in day7_rows]
+
+
+def _run_nurture_batch(db, now_utc: datetime, batch_limit: int):
+    if not ENABLE_NURTURE_EMAILS:
+        return {"enabled": False, "sent_day3": 0, "sent_day7": 0, "errors": 0}
+
+    sent_day3 = sent_day7 = errors = 0
+    day3_emails, day7_emails = _get_due_nurture_emails(db, now_utc, batch_limit)
+
+    for email in day3_emails:
+        try:
+            send_day3_email(email)
+            record_email_event(db, email, "day3")
+            sent_day3 += 1
+        except Exception as ex:
+            errors += 1
+            print(f"[nurture-error] email={email} err={ex}")
+
+    for email in day7_emails:
+        try:
+            send_day7_email(email)
+            record_email_event(db, email, "day7")
+            sent_day7 += 1
+        except Exception as ex:
+            errors += 1
+            print(f"[nurture-error] email={email} err={ex}")
+
+    return {
+        "enabled": True,
+        "sent_day3": sent_day3,
+        "sent_day7": sent_day7,
+        "errors": errors,
+    }
+
+
+@app.post(f"/{ADMIN_PATH}/nurture/run", dependencies=[Depends(require_admin)])
+def run_nurture(db=Depends(get_db)):
+    result = _run_nurture_batch(db, utcnow(), NURTURE_BATCH_LIMIT)
+    return {"ok": True, "nurture": result}
 
