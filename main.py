@@ -2,6 +2,7 @@ import os
 import re
 import hmac
 import hashlib
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -10,7 +11,7 @@ import resend
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
 
@@ -36,6 +37,7 @@ EMAIL_LOGO_URL = (os.getenv("EMAIL_LOGO_URL") or "https://www.problabs.net/brand
 
 ENABLE_NURTURE_EMAILS = (os.getenv("ENABLE_NURTURE_EMAILS") or "false").lower() == "true"
 NURTURE_BATCH_LIMIT = int((os.getenv("NURTURE_BATCH_LIMIT") or "25").strip())
+NURTURE_SEND_DELAY_SEC = float((os.getenv("NURTURE_SEND_DELAY_SEC") or "0").strip())
 
 LEADS_RATE_LIMIT_PER_IP_PER_DAY = int((os.getenv("LEADS_RATE_LIMIT_PER_IP_PER_DAY") or "25").strip())
 
@@ -51,7 +53,7 @@ Base = declarative_base()
 class Lead(Base):
     __tablename__ = "leads"
     id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True, nullable=False, index=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
@@ -60,14 +62,23 @@ class EmailEvent(Base):
     id = Column(Integer, primary_key=True)
     email = Column(String, nullable=False, index=True)
     event_type = Column(String, nullable=False, index=True)  # welcome/day3/day7
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # NOTE: Existing schema column is `sent_at` (timestamp without time zone).
+    sent_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("email", "event_type", name="email_events_email_event_type_key"),
+    )
 
 
 class EmailUnsubscribe(Base):
     __tablename__ = "email_unsubscribes"
-    id = Column(Integer, primary_key=True)
-    email = Column(String, unique=True, nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # NOTE: Existing schema uses `email` as the primary key and has no `id` column.
+    email = Column(String, primary_key=True)
+
+    # Existing schema column is `unsubscribed_at` (timestamp without time zone).
+    unsubscribed_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
 
 class LeadIpEvent(Base):
@@ -293,16 +304,114 @@ def send_day7_email(to_email: str):
 
 
 # =================================================
-# Nurture + Routes (unchanged)
+# Routes
 # =================================================
-# (rest of file continues exactly as before)
-# =================================================
-# Nurture logic + admin routes (RESTORED)
-# =================================================
-from fastapi import Depends
+@app.get("/")
+def root():
+    return {"ok": True}
 
 
-def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int):
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/leads")
+def create_lead(request: Request, db=Depends(get_db)):
+    body = {}
+    try:
+        body = request._body if hasattr(request, "_body") else {}
+    except Exception:
+        body = {}
+
+    # Parse JSON safely
+    try:
+        body = request.json()  # type: ignore
+    except Exception:
+        body = {}
+
+    # In FastAPI, better: await request.json(). But keeping your original approach structure.
+    # We'll handle both dict and coroutine-like results:
+    if hasattr(body, "__await__"):
+        # If it returned a coroutine, we can't await here (sync route). Fallback:
+        body = {}
+
+    email = normalize_email((body or {}).get("email", ""))
+    token = (body or {}).get("turnstileToken", "") or ""
+
+    # Get IP
+    ip = request.headers.get("cf-connecting-ip") or request.client.host if request.client else "0.0.0.0"
+
+    # Validate email
+    try:
+        validate_email(email, check_deliverability=False)
+    except EmailNotValidError:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    # Turnstile
+    if not verify_turnstile(token, ip):
+        raise HTTPException(status_code=400, detail="Turnstile verification failed")
+
+    # Rate limit per IP/day
+    today_start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    count = db.query(LeadIpEvent).filter(LeadIpEvent.ip == ip, LeadIpEvent.created_at >= today_start).count()
+    if count >= LEADS_RATE_LIMIT_PER_IP_PER_DAY:
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    db.add(LeadIpEvent(ip=ip))
+    db.commit()
+
+    # Insert lead (idempotent)
+    existing = db.query(Lead).filter_by(email=email).first()
+    if existing:
+        return {"ok": True, "inserted": False, "email_sent": False, "email_error": None}
+
+    lead = Lead(email=email)
+    db.add(lead)
+    db.commit()
+
+    # Welcome email (skip if unsubscribed)
+    email_sent = False
+    email_error = None
+    if not is_unsubscribed(db, email):
+        try:
+            send_welcome_email(email)
+            record_email_event(db, email, "welcome")
+            email_sent = True
+        except Exception as ex:
+            email_error = str(ex)
+
+    return {"ok": True, "inserted": True, "email_sent": email_sent, "email_error": email_error}
+
+
+@app.get("/unsubscribe")
+def unsubscribe(email: str, sig: str, db=Depends(get_db)):
+    email = normalize_email(email)
+
+    expected = hmac.new(
+        UNSUBSCRIBE_SECRET.encode(),
+        email.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Upsert unsubscribe
+    if not is_unsubscribed(db, email):
+        db.add(EmailUnsubscribe(email=email))
+        db.commit()
+
+    return {
+        "ok": True,
+        "message": "You have been unsubscribed. You will no longer receive emails from Probability AI Labs.",
+    }
+
+
+# =================================================
+# Nurture
+# =================================================
+def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[List[str], List[str]]:
     day3_cutoff = now_utc - timedelta(days=3)
     day7_cutoff = now_utc - timedelta(days=7)
 
@@ -340,14 +449,17 @@ def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int):
         {"cutoff": day7_cutoff, "lim": batch_limit},
     ).fetchall()
 
-    return [r[0] for r in day3_rows], [r[0] for r in day7_rows]
+    return ([r[0] for r in day3_rows], [r[0] for r in day7_rows])
 
 
-def _run_nurture_batch(db, now_utc: datetime, batch_limit: int):
+def _run_nurture_batch(db, now_utc: datetime, batch_limit: int) -> Dict[str, Any]:
     if not ENABLE_NURTURE_EMAILS:
         return {"enabled": False, "sent_day3": 0, "sent_day7": 0, "errors": 0}
 
-    sent_day3 = sent_day7 = errors = 0
+    sent_day3 = 0
+    sent_day7 = 0
+    errors = 0
+
     day3_emails, day7_emails = _get_due_nurture_emails(db, now_utc, batch_limit)
 
     for email in day3_emails:
@@ -355,25 +467,24 @@ def _run_nurture_batch(db, now_utc: datetime, batch_limit: int):
             send_day3_email(email)
             record_email_event(db, email, "day3")
             sent_day3 += 1
+            if NURTURE_SEND_DELAY_SEC > 0:
+                time.sleep(NURTURE_SEND_DELAY_SEC)
         except Exception as ex:
             errors += 1
-            print(f"[nurture-error] email={email} err={ex}")
+            print(f"[nurture-error] email={email} type={type(ex).__name__} msg={ex}")
 
     for email in day7_emails:
         try:
             send_day7_email(email)
             record_email_event(db, email, "day7")
             sent_day7 += 1
+            if NURTURE_SEND_DELAY_SEC > 0:
+                time.sleep(NURTURE_SEND_DELAY_SEC)
         except Exception as ex:
             errors += 1
-            print(f"[nurture-error] email={email} err={ex}")
+            print(f"[nurture-error] email={email} type={type(ex).__name__} msg={ex}")
 
-    return {
-        "enabled": True,
-        "sent_day3": sent_day3,
-        "sent_day7": sent_day7,
-        "errors": errors,
-    }
+    return {"enabled": True, "sent_day3": sent_day3, "sent_day7": sent_day7, "errors": errors}
 
 
 @app.post(f"/{ADMIN_PATH}/nurture/run", dependencies=[Depends(require_admin)])
