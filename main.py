@@ -6,11 +6,19 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
+# Load .env early (uvicorn won't load it automatically)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    # If python-dotenv isn't installed, env vars just won't be loaded from .env.
+    # We'll still run if env vars are set another way.
+    pass
+
 import httpx
 import resend
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
@@ -19,27 +27,32 @@ from email_validator import validate_email, EmailNotValidError
 # =================================================
 # Config
 # =================================================
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+def _getenv(name: str, default: str = "") -> str:
+    return (os.getenv(name) or default).strip()
+
+
+DATABASE_URL = _getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not configured")
+    raise RuntimeError("DATABASE_URL not configured (set it in .env or environment)")
 
-ADMIN_PATH = (os.getenv("ADMIN_PATH", "admin") or "admin").strip().strip("/")
+ADMIN_PATH = (_getenv("ADMIN_PATH", "admin") or "admin").strip().strip("/")
 
-TURNSTILE_SECRET_KEY = (os.getenv("TURNSTILE_SECRET_KEY") or "").strip()
-UNSUBSCRIBE_SECRET = (os.getenv("UNSUBSCRIBE_SECRET") or "").strip()
+ADMIN_API_KEY = _getenv("ADMIN_API_KEY")  # required for admin endpoints
+TURNSTILE_SECRET_KEY = _getenv("TURNSTILE_SECRET_KEY")
+UNSUBSCRIBE_SECRET = _getenv("UNSUBSCRIBE_SECRET")
 
-RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip()
-EMAIL_FROM = (os.getenv("EMAIL_FROM") or "Probability AI Labs <welcome@problabs.net>").strip()
-EMAIL_REPLY_TO = (os.getenv("EMAIL_REPLY_TO") or "support@problabs.net").strip()
+RESEND_API_KEY = _getenv("RESEND_API_KEY")
+EMAIL_FROM = _getenv("EMAIL_FROM", "Probability AI Labs <welcome@problabs.net>")
+EMAIL_REPLY_TO = _getenv("EMAIL_REPLY_TO", "support@problabs.net")
 
-PUBLIC_APP_URL = (os.getenv("PUBLIC_APP_URL") or "https://www.problabs.net").strip().rstrip("/")
-EMAIL_LOGO_URL = (os.getenv("EMAIL_LOGO_URL") or "https://www.problabs.net/branding/logo-probability-ai-labs.png").strip()
+PUBLIC_APP_URL = _getenv("PUBLIC_APP_URL", "https://www.problabs.net").rstrip("/")
+EMAIL_LOGO_URL = _getenv("EMAIL_LOGO_URL", "https://www.problabs.net/branding/logo-probability-ai-labs.png")
 
-ENABLE_NURTURE_EMAILS = (os.getenv("ENABLE_NURTURE_EMAILS") or "false").lower() == "true"
-NURTURE_BATCH_LIMIT = int((os.getenv("NURTURE_BATCH_LIMIT") or "25").strip())
-NURTURE_SEND_DELAY_SEC = float((os.getenv("NURTURE_SEND_DELAY_SEC") or "0").strip())
+ENABLE_NURTURE_EMAILS = _getenv("ENABLE_NURTURE_EMAILS", "false").lower() == "true"
+NURTURE_BATCH_LIMIT = int((_getenv("NURTURE_BATCH_LIMIT", "25") or "25"))
+NURTURE_SEND_DELAY_SEC = float((_getenv("NURTURE_SEND_DELAY_SEC", "0") or "0"))
 
-LEADS_RATE_LIMIT_PER_IP_PER_DAY = int((os.getenv("LEADS_RATE_LIMIT_PER_IP_PER_DAY") or "25").strip())
+LEADS_RATE_LIMIT_PER_IP_PER_DAY = int((_getenv("LEADS_RATE_LIMIT_PER_IP_PER_DAY", "25") or "25"))
 
 
 # =================================================
@@ -62,8 +75,7 @@ class EmailEvent(Base):
     id = Column(Integer, primary_key=True)
     email = Column(String, nullable=False, index=True)
     event_type = Column(String, nullable=False, index=True)  # welcome/day3/day7
-
-    # NOTE: Existing schema column is `sent_at` (timestamp without time zone).
+    # Existing schema column is `sent_at` (timestamp without time zone).
     sent_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -73,10 +85,8 @@ class EmailEvent(Base):
 
 class EmailUnsubscribe(Base):
     __tablename__ = "email_unsubscribes"
-
-    # NOTE: Existing schema uses `email` as the primary key and has no `id` column.
+    # Existing schema uses `email` as the primary key and has no `id` column.
     email = Column(String, primary_key=True)
-
     # Existing schema column is `unsubscribed_at` (timestamp without time zone).
     unsubscribed_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
 
@@ -88,23 +98,8 @@ class LeadIpEvent(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
-def ensure_tables():
+def ensure_tables() -> None:
     Base.metadata.create_all(bind=engine)
-
-
-# =================================================
-# App
-# =================================================
-app = FastAPI(title="ProbLabs Backend", version="0.2.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://www.problabs.net", "https://problabs.net"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
 
 
 def get_db():
@@ -120,14 +115,40 @@ def utcnow() -> datetime:
 
 
 # =================================================
+# App
+# =================================================
+app = FastAPI(title="ProbLabs Backend", version="0.3.0")
+
+# CORS: allow prod + local dev
+allow_origins = [
+    "https://www.problabs.net",
+    "https://problabs.net",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
+
+@app.on_event("startup")
+def _startup():
+    ensure_tables()
+
+
+# =================================================
 # Admin auth
 # =================================================
-def _admin_api_key() -> str:
-    return (os.getenv("ADMIN_API_KEY") or "").strip()
-
-
 def require_admin(x_admin_key: Optional[str] = Header(None)):
-    if not x_admin_key or x_admin_key != _admin_api_key():
+    # If ADMIN_API_KEY isn't set, admin endpoints should NOT be callable.
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured on server")
+    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -142,6 +163,7 @@ def normalize_email(email: str) -> str:
 
 
 def verify_turnstile(token: str, ip: str) -> bool:
+    # Local/dev convenience: if secret not configured, treat as disabled
     if not TURNSTILE_SECRET_KEY:
         return True
     if not token:
@@ -158,6 +180,8 @@ def verify_turnstile(token: str, ip: str) -> bool:
 
 
 def _resend_send(payload: dict):
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY not configured")
     resend.api_key = RESEND_API_KEY
     if hasattr(resend, "Emails"):
         return resend.Emails.send(payload)
@@ -165,6 +189,8 @@ def _resend_send(payload: dict):
 
 
 def build_unsubscribe_url(email: str) -> str:
+    if not UNSUBSCRIBE_SECRET:
+        raise RuntimeError("UNSUBSCRIBE_SECRET not configured")
     sig = hmac.new(
         UNSUBSCRIBE_SECRET.encode(),
         email.encode(),
@@ -182,12 +208,15 @@ def _email_header_logo_html() -> str:
 
 
 def _email_footer_html(email: str) -> str:
-    unsub_url = build_unsubscribe_url(email)
+    # If unsubscribe secret isn't configured, still send a footer without a link
+    unsub_block = ""
+    if UNSUBSCRIBE_SECRET:
+        unsub_url = build_unsubscribe_url(email)
+        unsub_block = f'<p style="font-size:12px;color:#777;"><a href="{unsub_url}">Unsubscribe</a></p>'
+
     return f"""
     <hr style="margin:24px 0;" />
-    <p style="font-size:12px;color:#777;">
-      <a href="{unsub_url}">Unsubscribe</a>
-    </p>
+    {unsub_block}
     <p style="font-size:12px;color:#777;">
       Probability AI Labs is not affiliated with the Florida Lottery.
       We provide analytical and educational information only.
@@ -202,6 +231,15 @@ def record_email_event(db, email: str, event_type: str):
 
 def is_unsubscribed(db, email: str) -> bool:
     return db.query(EmailUnsubscribe).filter_by(email=email).first() is not None
+
+
+def _get_client_ip(request: Request) -> str:
+    return (
+        request.headers.get("cf-connecting-ip")
+        or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "")
+        or "0.0.0.0"
+    )
 
 
 # =================================================
@@ -221,6 +259,7 @@ def send_welcome_email(to_email: str):
     return _resend_send({
         "from": EMAIL_FROM,
         "to": [to_email],
+        "reply_to": EMAIL_REPLY_TO,
         "subject": "Welcome to Probability AI Labs",
         "html": html,
     })
@@ -231,37 +270,29 @@ def send_day3_email(to_email: str):
     html = f"""
     {_email_header_logo_html()}
     <p>Hello,</p>
-
     <p>You’ll notice something different about <strong>Probability AI Labs</strong>.</p>
-
     <p>
       We don’t use hype.<br>
       We don’t promise wins.<br>
       And we don’t claim to “predict” lottery numbers.
     </p>
-
     <p><strong>That’s intentional — and here’s why.</strong></p>
-
     <p>
       Every Florida Lottery draw is random by design.
       Math cannot change that — but it can explain how probability behaves over time.
     </p>
-
     <p>
       Instead of predictions, we analyze historical data to understand frequency,
       distribution, variance, and long-term patterns.
     </p>
-
-    <p>
-      This provides clarity, not false confidence.
-    </p>
-
+    <p>This provides clarity, not false confidence.</p>
     <p>— Probability AI Labs</p>
     {_email_footer_html(to_email)}
     """
     return _resend_send({
         "from": EMAIL_FROM,
         "to": [to_email],
+        "reply_to": EMAIL_REPLY_TO,
         "subject": subject,
         "html": html,
     })
@@ -272,39 +303,33 @@ def send_day7_email(to_email: str):
     html = f"""
     {_email_header_logo_html()}
     <p>Hello,</p>
-
     <p>
       Here’s how <strong>Probability AI Labs</strong> approaches Florida Lottery analysis.
     </p>
-
     <p>
       We work exclusively with verified historical draw data.
       Using statistical tools, we examine frequency, distribution,
       and long-term deviations.
     </p>
-
     <p>
       This does not predict future outcomes.
       It helps users understand the system they are interacting with.
     </p>
-
-    <p>
-      No guarantees. No shortcuts. Just math.
-    </p>
-
+    <p>No guarantees. No shortcuts. Just math.</p>
     <p>— Probability AI Labs</p>
     {_email_footer_html(to_email)}
     """
     return _resend_send({
         "from": EMAIL_FROM,
         "to": [to_email],
+        "reply_to": EMAIL_REPLY_TO,
         "subject": subject,
         "html": html,
     })
 
 
 # =================================================
-# Routes
+# Public routes
 # =================================================
 @app.get("/")
 def root():
@@ -313,34 +338,22 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "admin_path": ADMIN_PATH}
 
 
 @app.post("/leads")
-def create_lead(request: Request, db=Depends(get_db)):
-    body = {}
-    try:
-        body = request._body if hasattr(request, "_body") else {}
-    except Exception:
-        body = {}
-
+async def create_lead(request: Request, db=Depends(get_db)):
     # Parse JSON safely
     try:
-        body = request.json()  # type: ignore
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
-        body = {}
-
-    # In FastAPI, better: await request.json(). But keeping your original approach structure.
-    # We'll handle both dict and coroutine-like results:
-    if hasattr(body, "__await__"):
-        # If it returned a coroutine, we can't await here (sync route). Fallback:
         body = {}
 
     email = normalize_email((body or {}).get("email", ""))
     token = (body or {}).get("turnstileToken", "") or ""
-
-    # Get IP
-    ip = request.headers.get("cf-connecting-ip") or request.client.host if request.client else "0.0.0.0"
+    ip = _get_client_ip(request)
 
     # Validate email
     try:
@@ -373,6 +386,7 @@ def create_lead(request: Request, db=Depends(get_db)):
     # Welcome email (skip if unsubscribed)
     email_sent = False
     email_error = None
+
     if not is_unsubscribed(db, email):
         try:
             send_welcome_email(email)
@@ -386,6 +400,9 @@ def create_lead(request: Request, db=Depends(get_db)):
 
 @app.get("/unsubscribe")
 def unsubscribe(email: str, sig: str, db=Depends(get_db)):
+    if not UNSUBSCRIBE_SECRET:
+        raise HTTPException(status_code=500, detail="UNSUBSCRIBE_SECRET not configured")
+
     email = normalize_email(email)
 
     expected = hmac.new(
@@ -409,7 +426,7 @@ def unsubscribe(email: str, sig: str, db=Depends(get_db)):
 
 
 # =================================================
-# Nurture
+# Nurture internals
 # =================================================
 def _get_due_nurture_emails(db, now_utc: datetime, batch_limit: int) -> Tuple[List[str], List[str]]:
     day3_cutoff = now_utc - timedelta(days=3)
@@ -485,6 +502,65 @@ def _run_nurture_batch(db, now_utc: datetime, batch_limit: int) -> Dict[str, Any
             print(f"[nurture-error] email={email} type={type(ex).__name__} msg={ex}")
 
     return {"enabled": True, "sent_day3": sent_day3, "sent_day7": sent_day7, "errors": errors}
+
+
+# =================================================
+# Admin routes
+# =================================================
+@app.get(f"/{ADMIN_PATH}/stats", dependencies=[Depends(require_admin)])
+def admin_stats(db=Depends(get_db)):
+    # Minimal stats for your /admin-stats page
+    leads_total = db.query(Lead).count()
+    unsub_total = db.query(EmailUnsubscribe).count()
+    events_total = db.query(EmailEvent).count()
+
+    # Sent counts by type
+    by_type = db.execute(text("""
+        SELECT event_type, COUNT(*) as cnt
+        FROM email_events
+        GROUP BY event_type
+        ORDER BY event_type
+    """)).fetchall()
+
+    return {
+        "ok": True,
+        "admin_path": ADMIN_PATH,
+        "db": "sqlite" if DATABASE_URL.startswith("sqlite") else "sql",
+        "counts": {
+            "leads": leads_total,
+            "unsubscribes": unsub_total,
+            "email_events": events_total,
+        },
+        "email_events_by_type": {row[0]: int(row[1]) for row in by_type},
+        "nurture": {
+            "enabled": ENABLE_NURTURE_EMAILS,
+            "batch_limit": NURTURE_BATCH_LIMIT,
+            "send_delay_sec": NURTURE_SEND_DELAY_SEC,
+        },
+    }
+
+
+@app.get(f"/{ADMIN_PATH}/leads", dependencies=[Depends(require_admin)])
+def admin_list_leads(limit: int = 50, offset: int = 0, db=Depends(get_db)):
+    lim = max(1, min(int(limit), 500))
+    off = max(0, int(offset))
+
+    rows = db.execute(
+        text("""
+        SELECT id, email, created_at
+        FROM leads
+        ORDER BY created_at DESC
+        LIMIT :lim OFFSET :off
+        """),
+        {"lim": lim, "off": off},
+    ).fetchall()
+
+    return {
+        "ok": True,
+        "limit": lim,
+        "offset": off,
+        "items": [{"id": r[0], "email": r[1], "created_at": str(r[2])} for r in rows],
+    }
 
 
 @app.post(f"/{ADMIN_PATH}/nurture/run", dependencies=[Depends(require_admin)])
