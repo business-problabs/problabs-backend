@@ -3,6 +3,8 @@ import re
 import hmac
 import hashlib
 import time
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -19,6 +21,7 @@ import httpx
 import resend
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
@@ -561,6 +564,112 @@ def admin_list_leads(limit: int = 50, offset: int = 0, db=Depends(get_db)):
         "offset": off,
         "items": [{"id": r[0], "email": r[1], "created_at": str(r[2])} for r in rows],
     }
+
+
+@app.get(f"/{ADMIN_PATH}/leads.csv", dependencies=[Depends(require_admin)])
+def admin_export_leads_csv(db=Depends(get_db)):
+    rows = db.execute(
+        text("""
+        SELECT
+          l.id,
+          l.email,
+          l.created_at,
+          CASE WHEN u.email IS NULL THEN 0 ELSE 1 END AS unsubscribed,
+
+          -- Sent flags (0/1)
+          SUM(CASE WHEN e.event_type = 'welcome' THEN 1 ELSE 0 END) AS welcome_sent,
+          SUM(CASE WHEN e.event_type = 'day3' THEN 1 ELSE 0 END) AS day3_sent,
+          SUM(CASE WHEN e.event_type = 'day7' THEN 1 ELSE 0 END) AS day7_sent,
+
+          -- Sent timestamps (if multiple, take earliest)
+          MIN(CASE WHEN e.event_type = 'welcome' THEN e.sent_at ELSE NULL END) AS welcome_sent_at,
+          MIN(CASE WHEN e.event_type = 'day3' THEN e.sent_at ELSE NULL END) AS day3_sent_at,
+          MIN(CASE WHEN e.event_type = 'day7' THEN e.sent_at ELSE NULL END) AS day7_sent_at
+
+        FROM leads l
+        LEFT JOIN email_events e ON e.email = l.email
+        LEFT JOIN email_unsubscribes u ON u.email = l.email
+        GROUP BY l.id, l.email, l.created_at, u.email
+        ORDER BY l.created_at DESC
+        """)
+    ).fetchall()
+
+    now_utc = utcnow()
+    day3_cutoff = now_utc - timedelta(days=3)
+    day7_cutoff = now_utc - timedelta(days=7)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+
+    w.writerow([
+        "id",
+        "email",
+        "created_at",
+        "unsubscribed",
+        "welcome_sent",
+        "welcome_sent_at",
+        "day3_sent",
+        "day3_sent_at",
+        "day7_sent",
+        "day7_sent_at",
+        "nurture_due_day3",
+        "nurture_due_day7",
+    ])
+
+    def _as_utc(dt_val):
+        if dt_val is None:
+            return None
+        if isinstance(dt_val, datetime):
+            return dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(dt_val).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    for r in rows:
+        lead_id = r[0]
+        email = r[1]
+        created_at_raw = r[2]
+        unsubscribed = bool(r[3])
+
+        welcome_sent = int(r[4] or 0) > 0
+        day3_sent = int(r[5] or 0) > 0
+        day7_sent = int(r[6] or 0) > 0
+
+        welcome_sent_at = _as_utc(r[7])
+        day3_sent_at = _as_utc(r[8])
+        day7_sent_at = _as_utc(r[9])
+
+        created_at_dt = _as_utc(created_at_raw)
+
+        due_day3 = False
+        due_day7 = False
+        if created_at_dt and not unsubscribed:
+            due_day3 = (created_at_dt <= day3_cutoff) and (not day3_sent)
+            due_day7 = (created_at_dt <= day7_cutoff) and (not day7_sent)
+
+        w.writerow([
+            lead_id,
+            email,
+            created_at_dt.isoformat() if created_at_dt else str(created_at_raw),
+            "yes" if unsubscribed else "no",
+            "yes" if welcome_sent else "no",
+            welcome_sent_at.isoformat() if welcome_sent_at else "",
+            "yes" if day3_sent else "no",
+            day3_sent_at.isoformat() if day3_sent_at else "",
+            "yes" if day7_sent else "no",
+            day7_sent_at.isoformat() if day7_sent_at else "",
+            "yes" if due_day3 else "no",
+            "yes" if due_day7 else "no",
+        ])
+
+    data = buf.getvalue().encode("utf-8")
+    return StreamingResponse(
+        iter([data]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=leads.csv"},
+    )
 
 
 @app.post(f"/{ADMIN_PATH}/nurture/run", dependencies=[Depends(require_admin)])

@@ -1,0 +1,35 @@
+name: Florida Lottery Daily Ingest
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 11:00 PM EST (approx, UTC 04:00)
+  workflow_dispatch: # Allows manual triggering from the GitHub Actions tab
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install sqlalchemy psycopg2-binary playwright beautifulsoup4 httpx asyncpg
+          playwright install chromium --with-deps
+
+      - name: Test Connection
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONPATH: .
+        run: python engine/test_db_connection.py
+
+      - name: Run Daily Ingest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONPATH: .
+        run: python engine/ingest_daily.py
