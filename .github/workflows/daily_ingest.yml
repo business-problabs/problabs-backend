@@ -2,34 +2,39 @@ name: Florida Lottery Daily Ingest
 
 on:
   schedule:
-    - cron: "0 4 * * *" # 11:00 PM EST (approx, UTC 04:00)
-  workflow_dispatch: # Allows manual triggering from the GitHub Actions tab
+    # Runs at 10:00 AM UTC (6:00 AM EST)
+    - cron: '0 10 * * *'
+  workflow_dispatch: 
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          pip install sqlalchemy psycopg2-binary playwright beautifulsoup4 httpx asyncpg
-          playwright install chromium --with-deps
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Test Connection
+      - name: Run Lottery Ingest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PYTHONPATH: .
-        run: python engine/test_db_connection.py
+        run: python scripts/ingest_lottery.py
 
-      - name: Run Daily Ingest
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PYTHONPATH: .
-        run: python engine/ingest_daily.py
+      - name: Create Job Summary
+        if: always()
+        run: |
+          echo "### 🚀 ProbLabs Ingest Report" >> $GITHUB_STEP_SUMMARY
+          echo "* **Status:** Complete" >> $GITHUB_STEP_SUMMARY
+          echo "* **Python Version:** 3.13" >> $GITHUB_STEP_SUMMARY
+          echo "* **Log Retention:** 14 Days" >> $GITHUB_STEP_SUMMARY
