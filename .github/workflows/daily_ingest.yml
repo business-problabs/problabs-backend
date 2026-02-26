@@ -1,31 +1,25 @@
-
 name: Florida Lottery Daily Ingest
 
 on:
   schedule:
-    # Runs every day at 10:00 AM UTC (6:00 AM EST)
+    # Runs at 10:00 AM UTC (6:00 AM EST)
     - cron: '0 10 * * *'
-  workflow_dispatch: # Allows Joe to run it manually for testing
+  workflow_dispatch: 
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    
-    # Set the 14-day retention rule for logs and artifacts
-    # This keeps Joe's storage under the 500MB free limit
-    timeout-minutes: 10
+    timeout-minutes: 15
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1 # Shallow clone for faster runs
 
-      - name: Set up Python
+      - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          cache: 'pip' # Speeds up daily runs
+          python-version: '3.13'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
@@ -34,19 +28,13 @@ jobs:
 
       - name: Run Lottery Ingest
         env:
-          # This pulls your Render URL from GitHub Secrets
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/ingest_lottery.py
 
-      - name: Generate Job Summary
-        if: always() # Ensure this runs even if the ingest script fails
+      - name: Create Job Summary
+        if: always()
         run: |
           echo "### 🚀 ProbLabs Ingest Report" >> $GITHUB_STEP_SUMMARY
-          echo "* **Run Date:** $(date)" >> $GITHUB_STEP_SUMMARY
-          echo "* **Environment:** GitHub Action (Ubuntu)" >> $GITHUB_STEP_SUMMARY
-          echo "* **Retention:** 14 Days" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Check the logs above if the status is not 'Success'." >> $GITHUB_STEP_SUMMARY
-
-# Global setting for the 14-day retention
-# Note: You also set this in the Repo Settings menu as we discussed
+          echo "* **Status:** Complete" >> $GITHUB_STEP_SUMMARY
+          echo "* **Python Version:** 3.13" >> $GITHUB_STEP_SUMMARY
+          echo "* **Log Retention:** 14 Days" >> $GITHUB_STEP_SUMMARY
