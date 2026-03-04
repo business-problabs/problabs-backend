@@ -401,6 +401,42 @@ async def create_lead(request: Request, db=Depends(get_db)):
     return {"ok": True, "inserted": True, "email_sent": email_sent, "email_error": email_error}
 
 
+# =================================================
+# Lottery Results API
+# =================================================
+SUPPORTED_GAMES = ["pick-3", "pick-4", "pick-5", "fantasy-5", "cash-pop"]
+
+@app.get("/api/v1/results/{game_name}/latest")
+def get_latest_results(game_name: str, db=Depends(get_db)):
+    """
+    Dynamically fetches the latest draw results for the specified game.
+    """
+    if game_name not in SUPPORTED_GAMES:
+        raise HTTPException(status_code=404, detail="Game not found or not supported.")
+
+    # ---------------------------------------------------------
+    # TODO: Replace this mock block with your actual SQLAlchemy query 
+    # Example raw SQL approach:
+    # row = db.execute(text("SELECT * FROM your_lottery_table WHERE game = :g ORDER BY date DESC LIMIT 1"), {"g": game_name}).fetchone()
+    # ---------------------------------------------------------
+    
+    # Mock response structure until your database query is plugged in
+    mock_data = {
+        "game": game_name,
+        "date": "2026-03-04",
+        "midday": ["7", "3", "6", "0", "5"] if game_name == "pick-5" else ["-", "-", "-"],
+        "evening": ["8", "7", "6", "3", "4"] if game_name == "pick-5" else ["-", "-", "-"],
+        "variance": {
+            "hot_digit": "7",
+            "hot_rate": "14.2%",
+            "cold_digit": "2",
+            "cold_rate": "4.1%"
+        }
+    }
+    
+    return mock_data
+
+
 @app.get("/unsubscribe")
 def unsubscribe(email: str, sig: str, db=Depends(get_db)):
     if not UNSUBSCRIBE_SECRET:
@@ -676,4 +712,3 @@ def admin_export_leads_csv(db=Depends(get_db)):
 def run_nurture(db=Depends(get_db)):
     result = _run_nurture_batch(db, utcnow(), NURTURE_BATCH_LIMIT)
     return {"ok": True, "nurture": result}
-
