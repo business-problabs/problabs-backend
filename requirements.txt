@@ -6,6 +6,7 @@ pydantic[email]==2.9.2
 # Database & ORM (Modernized for Python 3.13)
 sqlalchemy==2.0.35
 psycopg[binary]>=3.2.4
+psycopg2-binary==2.9.9
 asyncpg>=0.30.0
 
 # Data Analysis
