@@ -26,6 +26,9 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, t
 from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
 
+# Import your database models
+from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop
+
 
 # =================================================
 # Config
@@ -409,32 +412,66 @@ SUPPORTED_GAMES = ["pick-3", "pick-4", "pick-5", "fantasy-5", "cash-pop"]
 @app.get("/api/v1/results/{game_name}/latest")
 def get_latest_results(game_name: str, db=Depends(get_db)):
     """
-    Dynamically fetches the latest draw results for the specified game.
+    Dynamically fetches the latest draw results for the specified game from the PostgreSQL database.
     """
     if game_name not in SUPPORTED_GAMES:
         raise HTTPException(status_code=404, detail="Game not found or not supported.")
 
-    # ---------------------------------------------------------
-    # TODO: Replace this mock block with your actual SQLAlchemy query 
-    # Example raw SQL approach:
-    # row = db.execute(text("SELECT * FROM your_lottery_table WHERE game = :g ORDER BY date DESC LIMIT 1"), {"g": game_name}).fetchone()
-    # ---------------------------------------------------------
+    # 1. Map the URL parameter to the correct SQLAlchemy model
+    model_map = {
+        "pick-3": DrawPick3,
+        "pick-4": DrawPick4,
+        "pick-5": DrawPick5,
+        "fantasy-5": DrawFantasy5,
+        "cash-pop": DrawCashPop
+    }
+    model = model_map[game_name]
+
+    # 2. Query the two most recent draws (Midday and Evening logic)
+    recent_draws = db.query(model).order_by(model.draw_datetime.desc()).limit(2).all()
+
+    if not recent_draws:
+        # Fallback if the database is currently empty
+        return {"game": game_name, "date": "No Data", "midday": ["-"]*5, "evening": ["-"]*5}
+
+    # 3. Helper function to extract digits regardless of the game
+    def extract_digits(draw, game):
+        if game == "pick-3": return [str(draw.digit_1), str(draw.digit_2), str(draw.digit_3)]
+        if game == "pick-4": return [str(draw.digit_1), str(draw.digit_2), str(draw.digit_3), str(draw.digit_4)]
+        if game == "pick-5": return [str(draw.digit_1), str(draw.digit_2), str(draw.digit_3), str(draw.digit_4), str(draw.digit_5)]
+        if game == "fantasy-5": return [str(n) for n in draw.numbers] # handles the JSON list
+        if game == "cash-pop": return [str(draw.number)]
+        return []
+
+    # 4. Sort the two draws chronologically (Older = Midday, Newer = Evening)
+    sorted_draws = sorted(recent_draws, key=lambda x: x.draw_datetime)
     
-    # Mock response structure until your database query is plugged in
-    mock_data = {
+    midday_digits = ["-"] * 5
+    evening_digits = ["-"] * 5
+    
+    # Grab the date of the most recent draw
+    draw_date = sorted_draws[-1].draw_datetime.strftime("%Y-%m-%d") if sorted_draws[-1].draw_datetime else "Unknown"
+
+    if len(sorted_draws) == 2:
+        midday_digits = extract_digits(sorted_draws[0], game_name)
+        evening_digits = extract_digits(sorted_draws[1], game_name)
+    elif len(sorted_draws) == 1:
+        # If only one draw has happened so far for the current day/cycle
+        evening_digits = extract_digits(sorted_draws[0], game_name)
+
+    return {
         "game": game_name,
-        "date": "2026-03-04",
-        "midday": ["7", "3", "6", "0", "5"] if game_name == "pick-5" else ["-", "-", "-"],
-        "evening": ["8", "7", "6", "3", "4"] if game_name == "pick-5" else ["-", "-", "-"],
+        "date": draw_date,
+        "midday": midday_digits,
+        "evening": evening_digits,
         "variance": {
+            # Note: Hardcoded temporarily until we build the ComputedStatistic logic
             "hot_digit": "7",
             "hot_rate": "14.2%",
             "cold_digit": "2",
             "cold_rate": "4.1%"
         }
     }
-    
-    return mock_data
 
 
 @app.get("/unsubscribe")
