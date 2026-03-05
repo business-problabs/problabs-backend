@@ -20,3 +20,4 @@ httpx==0.27.2
 python-dotenv==1.0.1
 resend==2.4.0
 beautifulsoup4==4.12.3
+playwright
