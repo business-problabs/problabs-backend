@@ -27,7 +27,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
 
 # Import your database models
-from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop
+from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, ComputedStatistic
 
 
 # =================================================
@@ -459,18 +459,29 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         # If only one draw has happened so far for the current day/cycle
         evening_digits = extract_digits(sorted_draws[0], game_name)
 
+    # 5. Fetch the latest computed statistics for this game
+    stat = db.query(ComputedStatistic).filter(
+        ComputedStatistic.game_type == game_name,
+        ComputedStatistic.metric_name == "variance_30_day"
+    ).order_by(ComputedStatistic.computed_at.desc()).first()
+
+    if stat and stat.metric_value:
+        variance_data = stat.metric_value
+    else:
+        # Fallback if the math script hasn't run yet
+        variance_data = {
+            "hot_digit": "-",
+            "hot_rate": "-",
+            "cold_digit": "-",
+            "cold_rate": "-"
+        }
+
     return {
         "game": game_name,
         "date": draw_date,
         "midday": midday_digits,
         "evening": evening_digits,
-        "variance": {
-            # Note: Hardcoded temporarily until we build the ComputedStatistic logic
-            "hot_digit": "7",
-            "hot_rate": "14.2%",
-            "cold_digit": "2",
-            "cold_rate": "4.1%"
-        }
+        "variance": variance_data
     }
 
 
