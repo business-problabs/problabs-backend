@@ -1,12 +1,15 @@
 import asyncio
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import Counter
 from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import select
+
 from db import SessionLocal
-from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5
+from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, ComputedStatistic
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -53,7 +56,6 @@ async def fetch_and_parse():
             await page.wait_for_selector('.cmp-numbersearch__results-draw-date', timeout=60000)
             
             # Find all draw result blocks
-            # We'll use a locator that finds containers which likely hold the game name and results
             results = await page.locator(".cmp-numbersearch__results-draw-game").all()
             
             for res in results:
@@ -90,7 +92,6 @@ async def fetch_and_parse():
                     continue
 
                 # Extract winning numbers
-                # Look for digits in spans or the general block text
                 nums = [int(n) for n in re.findall(r'\b\d{1,2}\b', text.replace("2025", "").replace("2026", ""))]
                 
                 g_cfg = GAME_MAPPING[game_name]
@@ -122,33 +123,96 @@ async def fetch_and_parse():
 
     return parsed_data
 
+async def compute_and_store_statistics(session, api_game_name, model):
+    """Calculates the 30-day Hot/Cold digits and saves them to ComputedStatistic."""
+    logger.info(f"Calculating 30-day variance for {api_game_name}...")
+    
+    # Get cutoff date (30 days ago)
+    cutoff = datetime.now(EASTERN_TZ) - timedelta(days=30)
+    
+    # Query last 30 days of draws
+    stmt = select(model).where(model.draw_datetime >= cutoff)
+    result = await session.execute(stmt)
+    draws = result.scalars().all()
+    
+    if not draws:
+        logger.warning(f"No draws found in the last 30 days for {api_game_name}")
+        return
+
+    counts = Counter()
+    total_digits = 0
+    
+    # Count the digits
+    if api_game_name == "fantasy-5":
+        for draw in draws:
+            if draw.numbers:
+                counts.update(draw.numbers)
+                total_digits += len(draw.numbers)
+    else:
+        # For Pick 3, Pick 4, Pick 5
+        expected = 5 if api_game_name == "pick-5" else (4 if api_game_name == "pick-4" else 3)
+        for draw in draws:
+            for i in range(1, expected + 1):
+                val = getattr(draw, f"digit_{i}", None)
+                if val is not None:
+                    counts[val] += 1
+                    total_digits += 1
+                    
+    if not counts:
+        return
+
+    # Determine Hot/Cold
+    most_common = counts.most_common()
+    hot_val, hot_count = most_common[0]
+    cold_val, cold_count = most_common[-1]
+    
+    hot_rate = f"{(hot_count / total_digits) * 100:.1f}%" if total_digits > 0 else "0%"
+    cold_rate = f"{(cold_count / total_digits) * 100:.1f}%" if total_digits > 0 else "0%"
+    
+    metric_value = {
+        "hot_digit": str(hot_val),
+        "hot_rate": hot_rate,
+        "cold_digit": str(cold_val),
+        "cold_rate": cold_rate
+    }
+    
+    # Insert into database
+    new_stat = ComputedStatistic(
+        game_type=api_game_name,
+        metric_name="variance_30_day",
+        metric_value=metric_value
+    )
+    session.add(new_stat)
+
 async def ingest_daily():
     logger.info("Starting daily ingestion...")
     all_draws = await fetch_and_parse()
     total_new = 0
     
-    # 2. Database block using 'async with'
+    # Database block
     async with SessionLocal() as session:
         for game_name, draws in all_draws.items():
-            if not draws:
-                continue
-            
             model = GAME_MAPPING[game_name]["model"]
-            draws.sort(key=lambda x: x["draw_datetime"])
+            api_game_name = game_name.lower().replace(" ", "-")
+
+            if draws:
+                draws.sort(key=lambda x: x["draw_datetime"])
+                
+                chunk_size = 1000
+                for i in range(0, len(draws), chunk_size):
+                    chunk = draws[i : i + chunk_size]
+                    stmt = insert(model).values(chunk)
+                    stmt = stmt.on_conflict_do_nothing(index_elements=["draw_datetime"])
+                    await session.execute(stmt)
+                
+                total_new += len(draws)
             
-            chunk_size = 1000
-            for i in range(0, len(draws), chunk_size):
-                chunk = draws[i : i + chunk_size]
-                stmt = insert(model).values(chunk)
-                stmt = stmt.on_conflict_do_nothing(index_elements=["draw_datetime"])
-                await session.execute(stmt)
-            
-            total_new += len(draws)
+            # Always compute fresh stats, even if no new draws happened today
+            await compute_and_store_statistics(session, api_game_name, model)
             
         await session.commit()
     
-    print(f"Success: Processed {total_new} new draws from 2025-2026.")
+    print(f"Success: Processed {total_new} new draws from 2025-2026 and updated 30-day stats.")
 
 if __name__ == "__main__":
-    # 3. Called with asyncio.run()
     asyncio.run(ingest_daily())
