@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select
 
 from db import SessionLocal
-from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, ComputedStatistic
+from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, ComputedStatistic
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,7 @@ GAME_MAPPING = {
     "Pick 4": {"model": DrawPick4, "type": "pick4"},
     "Pick 5": {"model": DrawPick5, "type": "pick5"},
     "Fantasy 5": {"model": DrawFantasy5, "type": "fantasy5"},
+    "Cash Pop": {"model": DrawCashPop, "type": "cashpop"},
 }
 
 DRAW_TIMES = {
@@ -34,6 +35,7 @@ DRAW_TIMES = {
     "pick4": (21, 45),
     "pick5": (21, 45),
     "fantasy5": (23, 15),
+    "cashpop": (23, 15),
 }
 
 async def fetch_and_parse():
@@ -96,7 +98,13 @@ async def fetch_and_parse():
                 
                 g_cfg = GAME_MAPPING[game_name]
                 g_type = g_cfg["type"]
-                expected = 5 if g_type in ["pick5", "fantasy5"] else (4 if g_type == "pick4" else 3)
+                
+                if g_type == "cashpop":
+                    expected = 1
+                elif g_type in ["pick5", "fantasy5"]:
+                    expected = 5
+                else:
+                    expected = 4 if g_type == "pick4" else 3
                 
                 if len(nums) < expected:
                     continue
@@ -108,6 +116,8 @@ async def fetch_and_parse():
                 row = {"draw_datetime": draw_datetime}
                 if g_type == "fantasy5":
                     row["numbers"] = winning_numbers
+                elif g_type == "cashpop":
+                    row["number"] = winning_numbers[0]
                 else:
                     for i in range(expected):
                         row[f"digit_{i+1}"] = winning_numbers[i]
@@ -148,6 +158,11 @@ async def compute_and_store_statistics(session, api_game_name, model):
             if draw.numbers:
                 counts.update(draw.numbers)
                 total_digits += len(draw.numbers)
+    elif api_game_name == "cash-pop":
+        for draw in draws:
+            if draw.number is not None:
+                counts[draw.number] += 1
+                total_digits += 1
     else:
         # For Pick 3, Pick 4, Pick 5
         expected = 5 if api_game_name == "pick-5" else (4 if api_game_name == "pick-4" else 3)
