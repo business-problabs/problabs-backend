@@ -16,10 +16,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 EASTERN_TZ = ZoneInfo("US/Eastern")
-CUTOFF_DATE = datetime(2025, 8, 28, tzinfo=EASTERN_TZ)
+CUTOFF_DATE = datetime(2024, 1, 1, tzinfo=EASTERN_TZ)
 
-# Construct today's URL for Florida Lottery winning numbers
-TODAY_STR = datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
+# If the script runs at 6:00 AM EST (cron time), today's draws haven't happened yet!
+# We dynamically switch to scrape yesterday's date if it's before 8:00 AM EST.
+now_est = datetime.now(EASTERN_TZ)
+target_date = now_est - timedelta(days=1) if now_est.hour < 8 else now_est
+TODAY_STR = target_date.strftime("%Y-%m-%d")
+
 WINNING_NUMBERS_URL = f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}"
 
 GAME_MAPPING = {
@@ -67,8 +71,9 @@ async def fetch_and_parse():
                 
                 # Identify game
                 game_name = None
+                text_upper = text.upper()
                 for g in GAME_MAPPING.keys():
-                    if g in text:
+                    if g.upper() in text_upper:
                         game_name = g
                         break
                 
