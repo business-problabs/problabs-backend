@@ -427,12 +427,21 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
     }
     model = model_map[game_name]
 
-    # 2. Query the two most recent draws (Midday and Evening logic)
-    recent_draws = db.query(model).order_by(model.draw_datetime.desc()).limit(2).all()
+    # 2. Get the single most recent draw to determine the "latest date"
+    latest_draw = db.query(model).order_by(model.draw_datetime.desc()).first()
 
-    if not recent_draws:
+    if not latest_draw:
         # Fallback if the database is currently empty
-        return {"game": game_name, "date": "No Data", "midday": ["-"]*5, "evening": ["-"]*5}
+        empty_resp = {
+            "game": game_name,
+            "date": "No Data",
+            "variance": {"hot_digit": "-", "hot_rate": "-", "cold_digit": "-", "cold_rate": "-"}
+        }
+        if game_name == "cash-pop":
+            empty_resp.update({"morning": ["-"], "matinee": ["-"], "afternoon": ["-"], "evening": ["-"], "late_night": ["-"]})
+        else:
+            empty_resp.update({"midday": ["-"]*5, "evening": ["-"]*5})
+        return empty_resp
 
     # 3. Helper function to extract digits regardless of the game
     def extract_digits(draw, game):
@@ -443,21 +452,16 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         if game == "cash-pop": return [str(draw.number)]
         return []
 
-    # 4. Sort the two draws chronologically (Older = Midday, Newer = Evening)
-    sorted_draws = sorted(recent_draws, key=lambda x: x.draw_datetime)
+    # 4. Fetch all draws for that exact latest date
+    latest_date_start = latest_draw.draw_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+    latest_date_end = latest_date_start + timedelta(days=1)
     
-    midday_digits = ["-"] * 5
-    evening_digits = ["-"] * 5
+    todays_draws = db.query(model).filter(
+        model.draw_datetime >= latest_date_start,
+        model.draw_datetime < latest_date_end
+    ).order_by(model.draw_datetime.asc()).all()
     
-    # Grab the date of the most recent draw
-    draw_date = sorted_draws[-1].draw_datetime.strftime("%Y-%m-%d") if sorted_draws[-1].draw_datetime else "Unknown"
-
-    if len(sorted_draws) == 2:
-        midday_digits = extract_digits(sorted_draws[0], game_name)
-        evening_digits = extract_digits(sorted_draws[1], game_name)
-    elif len(sorted_draws) == 1:
-        # If only one draw has happened so far for the current day/cycle
-        evening_digits = extract_digits(sorted_draws[0], game_name)
+    draw_date = latest_draw.draw_datetime.strftime("%Y-%m-%d")
 
     # 5. Fetch the latest computed statistics for this game
     stat = db.query(ComputedStatistic).filter(
@@ -476,13 +480,40 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
             "cold_rate": "-"
         }
 
-    return {
+    response = {
         "game": game_name,
         "date": draw_date,
-        "midday": midday_digits,
-        "evening": evening_digits,
         "variance": variance_data
     }
+
+    # 6. Map draws to their proper time slots based on the hour they occurred
+    if game_name == "cash-pop":
+        draws_dict = {"morning": ["-"], "matinee": ["-"], "afternoon": ["-"], "evening": ["-"], "late_night": ["-"]}
+        for draw in todays_draws:
+            if not draw.draw_datetime: continue
+            hour = draw.draw_datetime.hour
+            digits = extract_digits(draw, game_name)
+            
+            if hour < 11: draws_dict["morning"] = digits
+            elif hour < 15: draws_dict["matinee"] = digits
+            elif hour < 19: draws_dict["afternoon"] = digits
+            elif hour < 22: draws_dict["evening"] = digits
+            else: draws_dict["late_night"] = digits
+            
+        response.update(draws_dict)
+    else:
+        draws_dict = {"midday": ["-"] * 5, "evening": ["-"] * 5}
+        for draw in todays_draws:
+            if not draw.draw_datetime: continue
+            hour = draw.draw_datetime.hour
+            digits = extract_digits(draw, game_name)
+            
+            if hour < 17: draws_dict["midday"] = digits
+            else: draws_dict["evening"] = digits
+            
+        response.update(draws_dict)
+
+    return response
 
 
 @app.get("/unsubscribe")
