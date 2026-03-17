@@ -98,8 +98,10 @@ async def fetch_and_parse():
                 except ValueError:
                     continue
 
-                # Extract winning numbers
-                nums = [int(n) for n in re.findall(r'\b\d{1,2}\b', text.replace("2025", "").replace("2026", ""))]
+                # Remove the date string so we don't accidentally extract the day of the month as a winning number
+                text_no_date = re.sub(r'[A-Za-z]+ \d{1,2}, \d{4}', '', text)
+                
+                nums = [int(n) for n in re.findall(r'\b\d{1,2}\b', text_no_date)]
                 
                 g_cfg = GAME_MAPPING[game_name]
                 g_type = g_cfg["type"]
