@@ -7,6 +7,7 @@ import csv
 import io
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
+from zoneinfo import ZoneInfo
 
 # Load .env early (uvicorn won't load it automatically)
 try:
@@ -409,6 +410,8 @@ async def create_lead(request: Request, db=Depends(get_db)):
 # =================================================
 SUPPORTED_GAMES = ["pick-3", "pick-4", "pick-5", "fantasy-5", "cash-pop"]
 
+EASTERN_TZ = ZoneInfo("US/Eastern")
+
 @app.get("/api/v1/results/{game_name}/latest")
 def get_latest_results(game_name: str, db=Depends(get_db)):
     """
@@ -452,8 +455,9 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         if game == "cash-pop": return [str(draw.number)]
         return []
 
-    # 4. Fetch all draws for that exact latest date
-    latest_date_start = latest_draw.draw_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
+    # 4. Convert UTC to Eastern to group all draws by the local Florida calendar day
+    latest_local = latest_draw.draw_datetime.astimezone(EASTERN_TZ)
+    latest_date_start = latest_local.replace(hour=0, minute=0, second=0, microsecond=0)
     latest_date_end = latest_date_start + timedelta(days=1)
     
     todays_draws = db.query(model).filter(
@@ -461,7 +465,7 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         model.draw_datetime < latest_date_end
     ).order_by(model.draw_datetime.asc()).all()
     
-    draw_date = latest_draw.draw_datetime.strftime("%Y-%m-%d")
+    draw_date = latest_local.strftime("%Y-%m-%d")
 
     # 5. Fetch the latest computed statistics for this game
     stat = db.query(ComputedStatistic).filter(
@@ -491,7 +495,7 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         draws_dict = {"morning": ["-"], "matinee": ["-"], "afternoon": ["-"], "evening": ["-"], "late_night": ["-"]}
         for draw in todays_draws:
             if not draw.draw_datetime: continue
-            hour = draw.draw_datetime.hour
+            hour = draw.draw_datetime.astimezone(EASTERN_TZ).hour
             digits = extract_digits(draw, game_name)
             
             if hour < 11: draws_dict["morning"] = digits
@@ -505,7 +509,7 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         draws_dict = {"midday": ["-"] * 5, "evening": ["-"] * 5}
         for draw in todays_draws:
             if not draw.draw_datetime: continue
-            hour = draw.draw_datetime.hour
+            hour = draw.draw_datetime.astimezone(EASTERN_TZ).hour
             digits = extract_digits(draw, game_name)
             
             if hour < 17: draws_dict["midday"] = digits
