@@ -26,7 +26,8 @@ TODAY_STR = target_date.strftime("%Y-%m-%d")
 
 URLS_TO_SCRAPE = [
     f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}",
-    f"https://floridalottery.com/games/winning-numbers?game=cashPop&searchBy=date&date={TODAY_STR}"
+    f"https://floridalottery.com/games/winning-numbers?game=cashPop&searchBy=date&date={TODAY_STR}",
+    f"https://floridalottery.com/games/winning-numbers?game=cash-pop&searchBy=date&date={TODAY_STR}"
 ]
 
 GAME_MAPPING = {
