@@ -25,9 +25,7 @@ target_date = now_est - timedelta(days=1) if now_est.hour < 8 else now_est
 TODAY_STR = target_date.strftime("%Y-%m-%d")
 
 URLS_TO_SCRAPE = [
-    "https://floridalottery.com/games/winning-numbers?game=all",
-    "https://floridalottery.com/games/winning-numbers?game=cashPop",
-    "https://floridalottery.com/games/winning-numbers?game=cash-pop",
+    f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}",
     "https://floridalottery.com/games/cash-pop"
 ]
 
