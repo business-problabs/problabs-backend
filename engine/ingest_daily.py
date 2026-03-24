@@ -64,7 +64,10 @@ async def fetch_and_parse():
                 
                 # 1. Targeted wait for results to appear
                 logger.info("Waiting for .cmp-numbersearch__results-draw-date selector...")
-                await page.wait_for_selector('.cmp-numbersearch__results-draw-date', timeout=60000)
+                try:
+                    await page.wait_for_selector('.cmp-numbersearch__results-draw-date', timeout=15000)
+                except Exception:
+                    logger.warning("Timeout waiting for date selector. Layout may have changed or no results exist yet.")
                 
                 # Find all draw result blocks
                 results = await page.locator(".cmp-numbersearch__results-draw-game").all()
