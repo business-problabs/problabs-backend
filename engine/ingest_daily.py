@@ -25,9 +25,9 @@ target_date = now_est - timedelta(days=1) if now_est.hour < 8 else now_est
 TODAY_STR = target_date.strftime("%Y-%m-%d")
 
 URLS_TO_SCRAPE = [
-    f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}",
-    f"https://floridalottery.com/games/winning-numbers?game=cashPop&searchBy=date&date={TODAY_STR}",
-    f"https://floridalottery.com/games/winning-numbers?game=cashpop&searchBy=date&date={TODAY_STR}",
+    "https://floridalottery.com/games/winning-numbers?game=all",
+    "https://floridalottery.com/games/winning-numbers?game=cashPop",
+    "https://floridalottery.com/games/winning-numbers?game=cash-pop",
     "https://floridalottery.com/games/cash-pop"
 ]
 
@@ -71,7 +71,12 @@ async def fetch_and_parse():
                 try:
                     await page.wait_for_selector('.cmp-numbersearch__results-draw-date', timeout=15000)
                 except Exception:
-                    logger.warning("Timeout waiting for date selector. Layout may have changed or no results exist yet.")
+                    try:
+                        page_title = await page.title()
+                        body_preview = (await page.inner_text("body"))[:200].replace("\n", " ")
+                        logger.warning(f"Timeout on date selector. Title: '{page_title}' | Body: '{body_preview}'")
+                    except Exception:
+                        logger.warning("Timeout waiting for date selector. Failed to extract debug text.")
                 
                 # Find all draw result blocks
                 results = await page.locator(".cmp-numbersearch__results-draw-game").all()
