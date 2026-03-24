@@ -82,6 +82,10 @@ async def fetch_and_parse():
                             game_name = g
                             break
                     
+                    # FALLBACK: If game name missing from text, but URL is explicitly Cash Pop
+                    if not game_name and ("cashPop" in url or "cash-pop" in url):
+                        game_name = "Cash Pop"
+
                     if not game_name:
                         continue
 
@@ -93,8 +97,9 @@ async def fetch_and_parse():
                         date_match = re.search(r'([A-Z][a-z]+ \d{1,2}, 20\d{2})', text)
                         date_str = date_match.group(1) if date_match else None
 
+                    # FALLBACK: If date missing from text, use the requested target date
                     if not date_str:
-                        continue
+                        date_str = target_date.strftime("%B %d, %Y")
                     
                     try:
                         draw_date = datetime.strptime(date_str.strip(), "%B %d, %Y").replace(tzinfo=EASTERN_TZ)
@@ -149,6 +154,32 @@ async def fetch_and_parse():
                     # Avoid duplicates in same run
                     if not any(d["draw_datetime"] == draw_datetime for d in parsed_data[game_name]):
                         parsed_data[game_name].append(row)
+                        
+                # ULTIMATE FALLBACK: If standard block parsing failed to find Cash Pop draws on a Cash Pop URL
+                if not parsed_data["Cash Pop"] and ("cashPop" in url or "cash-pop" in url):
+                    logger.warning(f"Standard parsing yielded no Cash Pop data on {url}. Using raw text fallback.")
+                    try:
+                        body_text = await page.inner_text("body")
+                        for draw_name in ["Morning", "Matinee", "Afternoon", "Evening", "Late Night"]:
+                            # Matches draw name followed by up to 150 chars and a valid Cash Pop number (1-15)
+                            match = re.search(fr'{draw_name}.{{0,150}}?\b([1-9]|1[0-5])\b', body_text, re.IGNORECASE | re.DOTALL)
+                            if match:
+                                num = int(match.group(1))
+                                hour, minute = 23, 45
+                                d_upper = draw_name.upper()
+                                if "MORNING" in d_upper: hour, minute = 8, 45
+                                elif "MATINEE" in d_upper: hour, minute = 13, 0
+                                elif "AFTERNOON" in d_upper: hour, minute = 16, 45
+                                elif "EVENING" in d_upper: hour, minute = 20, 45
+                                elif "LATE NIGHT" in d_upper: hour, minute = 23, 45
+                                
+                                draw_datetime = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                                if not any(d["draw_datetime"] == draw_datetime for d in parsed_data["Cash Pop"]):
+                                    parsed_data["Cash Pop"].append({"draw_datetime": draw_datetime, "number": num})
+                                    logger.info(f"Fallback parsed Cash Pop: [{num}] for {draw_datetime}")
+                    except Exception as fallback_e:
+                        logger.error(f"Raw text fallback failed: {fallback_e}")
+
             except Exception as e:
                 logger.error(f"Playwright error on {url}: {e}")
                 
