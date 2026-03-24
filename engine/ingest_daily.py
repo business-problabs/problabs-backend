@@ -26,8 +26,7 @@ TODAY_STR = target_date.strftime("%Y-%m-%d")
 
 URLS_TO_SCRAPE = [
     f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}",
-    f"https://floridalottery.com/games/winning-numbers?game=cashPop&searchBy=date&date={TODAY_STR}",
-    f"https://floridalottery.com/games/winning-numbers?game=cash-pop&searchBy=date&date={TODAY_STR}"
+    "https://floridalottery.com/games/cash-pop"
 ]
 
 GAME_MAPPING = {
@@ -159,13 +158,15 @@ async def fetch_and_parse():
                         parsed_data[game_name].append(row)
                         
                 # ULTIMATE FALLBACK: If standard block parsing failed to find Cash Pop draws on a Cash Pop URL
-                if not parsed_data["Cash Pop"] and ("cashPop" in url or "cash-pop" in url):
+                if not parsed_data["Cash Pop"] and "cash-pop" in url:
                     logger.warning(f"Standard parsing yielded no Cash Pop data on {url}. Using raw text fallback.")
                     try:
                         body_text = await page.inner_text("body")
+                        # Strip out times like 8:45 AM so we don't accidentally extract the hour as the winning number
+                        clean_text = re.sub(r'\b\d{1,2}:\d{2}\s*(?:AM|PM|a\.m\.|p\.m\.)', '', body_text, flags=re.IGNORECASE)
                         for draw_name in ["Morning", "Matinee", "Afternoon", "Evening", "Late Night"]:
-                            # Matches draw name followed by up to 150 chars and a valid Cash Pop number (1-15)
-                            match = re.search(fr'{draw_name}.{{0,150}}?\b([1-9]|1[0-5])\b', body_text, re.IGNORECASE | re.DOTALL)
+                            # Matches draw name followed by up to 100 chars and a valid Cash Pop number (1-15)
+                            match = re.search(fr'{draw_name}.{{0,100}}?\b([1-9]|1[0-5])\b', clean_text, re.IGNORECASE | re.DOTALL)
                             if match:
                                 num = int(match.group(1))
                                 hour, minute = 23, 45
