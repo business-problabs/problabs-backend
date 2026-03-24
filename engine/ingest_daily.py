@@ -61,10 +61,10 @@ async def fetch_and_parse():
         for url in URLS_TO_SCRAPE:
             logger.info(f"Navigating to {url}...")
             try:
-                await page.goto(url, wait_until="networkidle", timeout=60000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                if "cash-pop" in url:
-                    await page.wait_for_timeout(3000) # Give dynamic content time to load
+                # Always give dynamic content a few seconds to render
+                await page.wait_for_timeout(3000)
 
                 # 1. Targeted wait for results to appear
                 logger.info("Waiting for .cmp-numbersearch__results-draw-date selector...")
