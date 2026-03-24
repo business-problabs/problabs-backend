@@ -24,7 +24,10 @@ now_est = datetime.now(EASTERN_TZ)
 target_date = now_est - timedelta(days=1) if now_est.hour < 8 else now_est
 TODAY_STR = target_date.strftime("%Y-%m-%d")
 
-WINNING_NUMBERS_URL = f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}"
+URLS_TO_SCRAPE = [
+    f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}",
+    f"https://floridalottery.com/games/winning-numbers?game=cashPop&searchBy=date&date={TODAY_STR}"
+]
 
 GAME_MAPPING = {
     "Pick 3": {"model": DrawPick3, "type": "pick3"},
@@ -53,90 +56,103 @@ async def fetch_and_parse():
         )
         page = await context.new_page()
         
-        logger.info(f"Navigating to {WINNING_NUMBERS_URL}...")
-        try:
-            await page.goto(WINNING_NUMBERS_URL, wait_until="networkidle", timeout=60000)
-            
-            # 1. Targeted wait for results to appear
-            logger.info("Waiting for .cmp-numbersearch__results-draw-date selector...")
-            await page.wait_for_selector('.cmp-numbersearch__results-draw-date', timeout=60000)
-            
-            # Find all draw result blocks
-            results = await page.locator(".cmp-numbersearch__results-draw-game").all()
-            
-            for res in results:
-                text = await res.inner_text()
-                if not text:
-                    continue
+        for url in URLS_TO_SCRAPE:
+            logger.info(f"Navigating to {url}...")
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=60000)
                 
-                # Identify game
-                game_name = None
-                text_upper = text.upper()
-                for g in GAME_MAPPING.keys():
-                    if g.upper() in text_upper:
-                        game_name = g
-                        break
+                # 1. Targeted wait for results to appear
+                logger.info("Waiting for .cmp-numbersearch__results-draw-date selector...")
+                await page.wait_for_selector('.cmp-numbersearch__results-draw-date', timeout=60000)
                 
-                if not game_name:
-                    continue
-
-                # Extract date from the specific date element if possible, or from text
-                date_el = res.locator(".cmp-numbersearch__results-draw-date")
-                if await date_el.count() > 0:
-                    date_str = await date_el.inner_text()
-                else:
-                    date_match = re.search(r'([A-Z][a-z]+ \d{1,2}, 20\d{2})', text)
-                    date_str = date_match.group(1) if date_match else None
-
-                if not date_str:
-                    continue
+                # Find all draw result blocks
+                results = await page.locator(".cmp-numbersearch__results-draw-game").all()
                 
-                try:
-                    draw_date = datetime.strptime(date_str.strip(), "%B %d, %Y").replace(tzinfo=EASTERN_TZ)
-                    if draw_date < CUTOFF_DATE:
+                for res in results:
+                    text = await res.inner_text()
+                    if not text:
                         continue
-                except ValueError:
-                    continue
+                    
+                    # Identify game
+                    game_name = None
+                    text_upper = text.upper()
+                    for g in GAME_MAPPING.keys():
+                        if g.upper() in text_upper:
+                            game_name = g
+                            break
+                    
+                    if not game_name:
+                        continue
 
-                # Remove the date string so we don't accidentally extract the day of the month as a winning number
-                text_no_date = re.sub(r'[A-Za-z]+ \d{1,2}, \d{4}', '', text)
-                
-                nums = [int(n) for n in re.findall(r'\b\d{1,2}\b', text_no_date)]
-                
-                g_cfg = GAME_MAPPING[game_name]
-                g_type = g_cfg["type"]
-                
-                if g_type == "cashpop":
-                    expected = 1
-                elif g_type in ["pick5", "fantasy5"]:
-                    expected = 5
-                else:
-                    expected = 4 if g_type == "pick4" else 3
-                
-                if len(nums) < expected:
-                    continue
-                
-                winning_numbers = nums[:expected]
-                hour, minute = DRAW_TIMES.get(g_type, (21, 45))
-                draw_datetime = draw_date.replace(hour=hour, minute=minute)
+                    # Extract date from the specific date element if possible, or from text
+                    date_el = res.locator(".cmp-numbersearch__results-draw-date")
+                    if await date_el.count() > 0:
+                        date_str = await date_el.inner_text()
+                    else:
+                        date_match = re.search(r'([A-Z][a-z]+ \d{1,2}, 20\d{2})', text)
+                        date_str = date_match.group(1) if date_match else None
 
-                row = {"draw_datetime": draw_datetime}
-                if g_type == "fantasy5":
-                    row["numbers"] = winning_numbers
-                elif g_type == "cashpop":
-                    row["number"] = winning_numbers[0]
-                else:
-                    for i in range(expected):
-                        row[f"digit_{i+1}"] = winning_numbers[i]
-                
-                # Avoid duplicates in same run
-                if not any(d["draw_datetime"] == draw_datetime for d in parsed_data[game_name]):
-                    parsed_data[game_name].append(row)
+                    if not date_str:
+                        continue
+                    
+                    try:
+                        draw_date = datetime.strptime(date_str.strip(), "%B %d, %Y").replace(tzinfo=EASTERN_TZ)
+                        if draw_date < CUTOFF_DATE:
+                            continue
+                    except ValueError:
+                        continue
 
-            await browser.close()
-        except Exception as e:
-            logger.error(f"Playwright error: {e}")
-            await browser.close()
+                    # Remove the date string so we don't accidentally extract the day of the month as a winning number
+                    text_no_date = re.sub(r'[A-Za-z]+ \d{1,2}, \d{4}', '', text)
+                    
+                    nums = [int(n) for n in re.findall(r'\b\d{1,2}\b', text_no_date)]
+                    
+                    g_cfg = GAME_MAPPING[game_name]
+                    g_type = g_cfg["type"]
+                    
+                    if g_type == "cashpop":
+                        expected = 1
+                    elif g_type in ["pick5", "fantasy5"]:
+                        expected = 5
+                    else:
+                        expected = 4 if g_type == "pick4" else 3
+                    
+                    if len(nums) < expected:
+                        continue
+                    
+                    winning_numbers = nums[:expected]
+                    hour, minute = DRAW_TIMES.get(g_type, (21, 45))
+
+                    if g_type == "cashpop":
+                        if "MORNING" in text_upper: hour, minute = 8, 45
+                        elif "MATINEE" in text_upper: hour, minute = 13, 0
+                        elif "AFTERNOON" in text_upper: hour, minute = 16, 45
+                        elif "EVENING" in text_upper: hour, minute = 20, 45
+                        elif "LATE NIGHT" in text_upper: hour, minute = 23, 45
+                    elif g_type in ["pick3", "pick4", "pick5"]:
+                        if "MIDDAY" in text_upper: hour, minute = 13, 30
+                        elif "EVENING" in text_upper: hour, minute = 21, 45
+
+                    logger.info(f"Parsed {game_name}: {winning_numbers} for {draw_date.strftime('%Y-%m-%d')} at {hour:02d}:{minute:02d}")
+                    draw_datetime = draw_date.replace(hour=hour, minute=minute)
+
+                    row = {"draw_datetime": draw_datetime}
+                    if g_type == "fantasy5":
+                        row["numbers"] = winning_numbers
+                    elif g_type == "cashpop":
+                        row["number"] = winning_numbers[0]
+                    else:
+                        for i in range(expected):
+                            row[f"digit_{i+1}"] = winning_numbers[i]
+                    
+                    # Avoid duplicates in same run
+                    if not any(d["draw_datetime"] == draw_datetime for d in parsed_data[game_name]):
+                        parsed_data[game_name].append(row)
+            except Exception as e:
+                logger.error(f"Playwright error on {url}: {e}")
+                
+        # Close the browser AFTER both URLs have been fully scraped
+        await browser.close()
 
     return parsed_data
 
