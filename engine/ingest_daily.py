@@ -26,6 +26,8 @@ TODAY_STR = target_date.strftime("%Y-%m-%d")
 
 URLS_TO_SCRAPE = [
     f"https://floridalottery.com/games/winning-numbers?game=all&searchBy=date&date={TODAY_STR}",
+    f"https://floridalottery.com/games/winning-numbers?game=cashPop&searchBy=date&date={TODAY_STR}",
+    f"https://floridalottery.com/games/winning-numbers?game=cashpop&searchBy=date&date={TODAY_STR}",
     "https://floridalottery.com/games/cash-pop"
 ]
 
@@ -61,6 +63,9 @@ async def fetch_and_parse():
             try:
                 await page.goto(url, wait_until="networkidle", timeout=60000)
                 
+                if "cash-pop" in url:
+                    await page.wait_for_timeout(3000) # Give dynamic content time to load
+
                 # 1. Targeted wait for results to appear
                 logger.info("Waiting for .cmp-numbersearch__results-draw-date selector...")
                 try:
@@ -85,7 +90,7 @@ async def fetch_and_parse():
                             break
                     
                     # FALLBACK: If game name missing from text, but URL is explicitly Cash Pop
-                    if not game_name and ("cashPop" in url or "cash-pop" in url):
+                    if not game_name and ("cashPop" in url or "cashpop" in url or "cash-pop" in url):
                         game_name = "Cash Pop"
 
                     if not game_name:
@@ -164,9 +169,14 @@ async def fetch_and_parse():
                         body_text = await page.inner_text("body")
                         # Strip out times like 8:45 AM so we don't accidentally extract the hour as the winning number
                         clean_text = re.sub(r'\b\d{1,2}:\d{2}\s*(?:AM|PM|a\.m\.|p\.m\.)', '', body_text, flags=re.IGNORECASE)
+                        
                         for draw_name in ["Morning", "Matinee", "Afternoon", "Evening", "Late Night"]:
-                            # Matches draw name followed by up to 100 chars and a valid Cash Pop number (1-15)
-                            match = re.search(fr'{draw_name}.{{0,100}}?\b([1-9]|1[0-5])\b', clean_text, re.IGNORECASE | re.DOTALL)
+                            idx = clean_text.lower().find(draw_name.lower())
+                            if idx != -1:
+                                logger.info(f"Found '{draw_name}' snippet: {clean_text[idx:idx+250].replace('\n', ' ')}")
+                                
+                            # Matches draw name followed by up to 250 chars and a valid Cash Pop number (1-15)
+                            match = re.search(fr'{draw_name}.{{0,250}}?\b([1-9]|1[0-5])\b', clean_text, re.IGNORECASE | re.DOTALL)
                             if match:
                                 num = int(match.group(1))
                                 hour, minute = 23, 45
