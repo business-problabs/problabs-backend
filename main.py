@@ -5,6 +5,7 @@ import hashlib
 import time
 import csv
 import io
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List, Dict, Any
 from zoneinfo import ZoneInfo
@@ -518,6 +519,109 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
         response.update(draws_dict)
 
     return response
+
+
+# =================================================
+# PRO — Historical Backtesting Endpoint
+# GET /api/v1/results/{game_name}/variance?period=3m|6m|1y|all
+# =================================================
+
+PERIOD_DAYS = {
+    "30d": 30,
+    "3m":  90,
+    "6m":  180,
+    "1y":  365,
+    "all": None,  # No cutoff — query entire history
+}
+
+@app.get("/api/v1/results/{game_name}/variance")
+def get_historical_variance(game_name: str, period: str = "30d", db=Depends(get_db)):
+    """
+    Pro endpoint: returns hot/cold variance for a given game and time period.
+    period options: 30d, 3m, 6m, 1y, all
+    """
+    if game_name not in SUPPORTED_GAMES:
+        raise HTTPException(status_code=404, detail="Game not found.")
+
+    if period not in PERIOD_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid period '{period}'. Choose from: {list(PERIOD_DAYS.keys())}"
+        )
+
+    model_map = {
+        "pick-3":    DrawPick3,
+        "pick-4":    DrawPick4,
+        "pick-5":    DrawPick5,
+        "fantasy-5": DrawFantasy5,
+        "cash-pop":  DrawCashPop,
+    }
+    model = model_map[game_name]
+
+    # Build query — apply cutoff only if period is not "all"
+    days = PERIOD_DAYS[period]
+    query = db.query(model)
+    if days is not None:
+        cutoff = datetime.now(EASTERN_TZ) - timedelta(days=days)
+        query = query.filter(model.draw_datetime >= cutoff)
+
+    draws = query.all()
+
+    if not draws:
+        raise HTTPException(status_code=404, detail=f"No draw data found for '{game_name}' in period '{period}'.")
+
+    # Count digits across all draws in the period
+    counts = Counter()
+    total_digits = 0
+
+    if game_name == "fantasy-5":
+        for draw in draws:
+            if draw.numbers:
+                counts.update(draw.numbers)
+                total_digits += len(draw.numbers)
+    elif game_name == "cash-pop":
+        for draw in draws:
+            if draw.number is not None:
+                counts[draw.number] += 1
+                total_digits += 1
+    else:
+        # pick-3, pick-4, pick-5
+        digit_count = {"pick-3": 3, "pick-4": 4, "pick-5": 5}[game_name]
+        for draw in draws:
+            for i in range(1, digit_count + 1):
+                val = getattr(draw, f"digit_{i}", None)
+                if val is not None:
+                    counts[val] += 1
+                    total_digits += 1
+
+    if not counts:
+        raise HTTPException(status_code=404, detail="No digit data found in draws.")
+
+    # Build ranked frequency list
+    ranked = [
+        {
+            "digit": str(digit),
+            "count": count,
+            "rate": f"{(count / total_digits) * 100:.1f}%"
+        }
+        for digit, count in counts.most_common()
+    ]
+
+    most_common = counts.most_common()
+    hot_val, hot_count = most_common[0]
+    cold_val, cold_count = most_common[-1]
+
+    return {
+        "game":         game_name,
+        "period":       period,
+        "total_draws":  len(draws),
+        "total_digits": total_digits,
+        "hot_digit":    str(hot_val),
+        "hot_rate":     f"{(hot_count / total_digits) * 100:.1f}%",
+        "cold_digit":   str(cold_val),
+        "cold_rate":    f"{(cold_count / total_digits) * 100:.1f}%",
+        "ranked":       ranked,
+    }
 
 
 @app.get("/unsubscribe")
