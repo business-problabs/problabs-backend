@@ -106,3 +106,20 @@ class ComputedStatistic(Base):
     metric_name: Mapped[str] = mapped_column(String, index=True)
     metric_value: Mapped[dict] = mapped_column(JSON)
     computed_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# --- AUTH ---
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(CITEXT(), unique=True, index=True, nullable=False)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    last_login_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )

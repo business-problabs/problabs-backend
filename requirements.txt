@@ -21,3 +21,4 @@ python-dotenv==1.0.1
 resend==2.4.0
 beautifulsoup4==4.12.3
 playwright
+PyJWT==2.9.0
