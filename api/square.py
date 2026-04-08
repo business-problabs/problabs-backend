@@ -68,7 +68,7 @@ async def square_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     event = json.loads(payload)
     event_type = event.get("type", "")
     data = event.get("data", {}).get("object", {})
-    if event_type == "payment.completed":
+    if event_type == "payment.updated" and (data.get("payment", {}).get("status") == "COMPLETED"):
         payment = data.get("payment", {})
         email = (payment.get("buyer_email_address") or "").strip()
         square_customer_id = payment.get("customer_id")
