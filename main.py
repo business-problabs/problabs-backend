@@ -31,6 +31,7 @@ from email_validator import validate_email, EmailNotValidError
 # Import your database models
 from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, ComputedStatistic, User
 from api.auth import router as auth_router
+from api.square import router as square_router
 
 
 # =================================================
@@ -145,6 +146,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router)
+app.include_router(square_router)
 
 
 @app.on_event("startup")
