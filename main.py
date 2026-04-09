@@ -32,6 +32,7 @@ from email_validator import validate_email, EmailNotValidError
 from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, ComputedStatistic, User
 from api.main import app as api_app
 from api.main import router as api_main_router
+from api.auth import router as auth_router
 from api.square import router as square_router
 
 
@@ -148,6 +149,7 @@ app.add_middleware(
 
 app.mount("/api", api_app)
 app.include_router(api_main_router)
+app.include_router(auth_router)
 app.include_router(square_router)
 
 
