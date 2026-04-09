@@ -1,11 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from db import SessionLocal
 from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5
 from typing import Any, Dict
 
-app = FastAPI(title="ProbLabs API", version="0.1.0")
+router = APIRouter()
 
 # Mapping of game_type strings to models
 GAME_MODELS = {
@@ -20,11 +20,11 @@ async def get_db():
     async with SessionLocal() as session:
         yield session
 
-@app.get("/health-check")
+@router.get("/health-check")
 async def health_check():
     return {"status": "ok"}
 
-@app.get("/latest/{game_type}")
+@router.get("/latest/{game_type}")
 async def get_latest_draw(game_type: str, db: AsyncSession = Depends(get_db)):
     # Validate game_type
     model = GAME_MODELS.get(game_type.lower())
