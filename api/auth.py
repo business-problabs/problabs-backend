@@ -42,7 +42,7 @@ def _env(name: str, default: str = "") -> str:
 JWT_SECRET          = _env("JWT_SECRET")
 MAGIC_EXPIRY_MIN    = int(_env("MAGIC_LINK_EXPIRY_MINUTES", "15"))
 SESSION_EXPIRY_DAYS = int(_env("SESSION_EXPIRY_DAYS", "30"))
-SESSION_COOKIE      = "pb_session"
+SESSION_COOKIE      = "problabs_session"
 PUBLIC_APP_URL      = _env("PUBLIC_APP_URL", "https://www.problabs.net").rstrip("/")
 RESEND_API_KEY      = _env("RESEND_API_KEY")
 EMAIL_FROM          = _env("EMAIL_FROM", "Probability AI Labs <welcome@problabs.net>")
@@ -128,6 +128,16 @@ def _decode_session_cookie(request: Request) -> Optional[dict]:
 
 def require_session(request: Request) -> dict:
     payload = _decode_session_cookie(request)
+    if not payload:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            try:
+                p = jwt.decode(token, _secret(), algorithms=["HS256"])
+                if p.get("typ") == "session":
+                    payload = p
+            except Exception:
+                pass
     if not payload:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return payload
@@ -220,9 +230,12 @@ def auth_callback(token: str, db: Session = Depends(get_db)):
 
 
 @router.get("/me")
-def get_me(session: dict = Depends(require_session)):
-    """Return the currently authenticated user from the session cookie."""
-    return {"user_id": session["sub"], "email": session["email"]}
+def get_me(session: dict = Depends(require_session), db: Session = Depends(get_db)):
+    """Return the currently authenticated user from the session cookie or Bearer token."""
+    user = db.query(User).filter_by(id=int(session["sub"])).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": session["sub"], "email": session["email"], "is_pro": user.is_pro}
 
 
 @router.post("/logout")

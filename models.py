@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from typing import Optional
 import sqlalchemy as sa
-from sqlalchemy import DateTime, Integer, String, Text, func, JSON
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, func, JSON
 from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -123,3 +124,6 @@ class User(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    is_pro: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    square_customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    square_subscription_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
