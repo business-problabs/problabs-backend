@@ -104,13 +104,14 @@ def decode_magic_token(token: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid magic link token.")
 
 
-def encode_session_token(user_id: int, email: str) -> str:
+def encode_session_token(user_id: int, email: str, is_pro: bool = False) -> str:
     """Long-lived session JWT returned to the frontend."""
     payload = {
-        "sub":   str(user_id),
-        "email": email,
-        "typ":   "session",
-        "exp":   datetime.now(timezone.utc) + timedelta(days=SESSION_EXPIRY_DAYS),
+        "sub":    str(user_id),
+        "email":  email,
+        "is_pro": is_pro,
+        "typ":    "session",
+        "exp":    datetime.now(timezone.utc) + timedelta(days=SESSION_EXPIRY_DAYS),
     }
     return jwt.encode(payload, _secret(), algorithm="HS256")
 
@@ -220,12 +221,13 @@ def auth_callback(token: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    session_token = encode_session_token(user.id, user.email)
+    session_token = encode_session_token(user.id, user.email, is_pro=user.is_pro)
     return {
         "ok":      True,
         "token":   session_token,
         "email":   user.email,
         "user_id": user.id,
+        "is_pro":  user.is_pro,
     }
 
 
