@@ -31,8 +31,9 @@ async def get_db():
 def _verify_square_signature(payload: bytes, signature: str, url: str) -> bool:
     if not SQUARE_WEBHOOK_SIGNATURE_KEY:
         return False
-    combined = SQUARE_WEBHOOK_SIGNATURE_KEY + url + payload.decode("utf-8")
-    expected = hmac.new(SQUARE_WEBHOOK_SIGNATURE_KEY.encode(), combined.encode(), hashlib.sha256).digest()
+    # Per Square docs: HMAC-SHA256(key, notification_url + raw_body)
+    msg = url + payload.decode("utf-8")
+    expected = hmac.new(SQUARE_WEBHOOK_SIGNATURE_KEY.encode(), msg.encode(), hashlib.sha256).digest()
     return hmac.compare_digest(base64.b64encode(expected).decode(), signature)
 
 @router.post("/checkout")
@@ -63,7 +64,8 @@ async def create_checkout(request: Request, db: AsyncSession = Depends(get_db)):
 async def square_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     payload = await request.body()
     signature = request.headers.get("x-square-hmacsha256-signature", "")
-    if False:  # TODO: re-enable signature verification in production
+    url = str(request.url)
+    if SQUARE_WEBHOOK_SIGNATURE_KEY and not _verify_square_signature(payload, signature, url):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
     event = json.loads(payload)
     event_type = event.get("type", "")
