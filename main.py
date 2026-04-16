@@ -629,6 +629,94 @@ def get_historical_variance(game_name: str, period: str = "30d", db=Depends(get_
     }
 
 
+# GET /api/v1/results/{game_name}/position-variance?period=3m|6m|1y|all
+# Pro endpoint: returns per-position digit frequency for Pick 3/4/5.
+# Fantasy 5 and Cash Pop return a 422 (not applicable).
+@app.get("/api/v1/results/{game_name}/position-variance")
+def get_position_variance(game_name: str, period: str = "3m", db=Depends(get_db)):
+    """
+    Returns digit frequency broken down by position.
+    Supported games: pick-3, pick-4, pick-5.
+    """
+    POSITIONAL_GAMES = {
+        "pick-3": (DrawPick3, 3),
+        "pick-4": (DrawPick4, 4),
+        "pick-5": (DrawPick5, 5),
+    }
+
+    if game_name not in SUPPORTED_GAMES:
+        raise HTTPException(status_code=404, detail="Game not found.")
+
+    if game_name not in POSITIONAL_GAMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Position variance is not applicable for '{game_name}'. Use pick-3, pick-4, or pick-5."
+        )
+
+    if period not in PERIOD_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid period '{period}'. Choose from: {list(PERIOD_DAYS.keys())}"
+        )
+
+    model, num_positions = POSITIONAL_GAMES[game_name]
+
+    days = PERIOD_DAYS[period]
+    query = db.query(model)
+    if days is not None:
+        cutoff = datetime.now(EASTERN_TZ) - timedelta(days=days)
+        query = query.filter(model.draw_datetime >= cutoff)
+
+    draws = query.all()
+
+    if not draws:
+        raise HTTPException(status_code=404, detail=f"No draw data found for '{game_name}' in period '{period}'.")
+
+    # Build per-position counters
+    position_counters = [Counter() for _ in range(num_positions)]
+
+    for draw in draws:
+        for i in range(num_positions):
+            val = getattr(draw, f"digit_{i + 1}", None)
+            if val is not None:
+                position_counters[i][val] += 1
+
+    positions = []
+    for i, counter in enumerate(position_counters):
+        total = sum(counter.values())
+        if total == 0:
+            continue
+        ranked = [
+            {
+                "digit": str(digit),
+                "count": count,
+                "rate": f"{(count / total) * 100:.1f}%",
+                "pct": round((count / total) * 100, 1),
+            }
+            for digit, count in counter.most_common()
+        ]
+        most_common = counter.most_common()
+        hot_val, hot_count = most_common[0]
+        cold_val, cold_count = most_common[-1]
+        positions.append({
+            "position": i + 1,
+            "label": f"Position {i + 1}",
+            "total_draws": total,
+            "hot_digit": str(hot_val),
+            "hot_rate": f"{(hot_count / total) * 100:.1f}%",
+            "cold_digit": str(cold_val),
+            "cold_rate": f"{(cold_count / total) * 100:.1f}%",
+            "ranked": ranked,
+        })
+
+    return {
+        "game":        game_name,
+        "period":      period,
+        "total_draws": len(draws),
+        "positions":   positions,
+    }
+
+
 @app.get("/unsubscribe")
 def unsubscribe(email: str, sig: str, db=Depends(get_db)):
     if not UNSUBSCRIBE_SECRET:
