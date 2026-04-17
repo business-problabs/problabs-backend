@@ -237,7 +237,30 @@ def get_me(session: dict = Depends(require_session), db: Session = Depends(get_d
     user = db.query(User).filter_by(id=int(session["sub"])).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return {"user_id": session["sub"], "email": session["email"], "is_pro": user.is_pro}
+
+    now = datetime.now(timezone.utc)
+    # Effective Pro: is_pro flag AND (no expiry set, OR expiry hasn't passed yet)
+    effective_pro = user.is_pro and (
+        user.subscription_ends_at is None or user.subscription_ends_at > now
+    )
+
+    # Subscription status string for the dashboard UI
+    if not user.is_pro:
+        subscription_status = "inactive"
+    elif user.subscription_ends_at is not None:
+        subscription_status = "cancelling"
+    else:
+        subscription_status = "active"
+
+    return {
+        "user_id": session["sub"],
+        "email": session["email"],
+        "is_pro": effective_pro,
+        "subscription_status": subscription_status,
+        "subscription_ends_at": (
+            user.subscription_ends_at.isoformat() if user.subscription_ends_at else None
+        ),
+    }
 
 
 @router.post("/logout")

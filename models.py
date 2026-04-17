@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 import sqlalchemy as sa
 from sqlalchemy import Boolean, DateTime, Integer, String, Text, func, JSON
@@ -127,3 +128,4 @@ class User(Base):
     is_pro: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     square_customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     square_subscription_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    subscription_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
