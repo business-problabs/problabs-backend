@@ -24,13 +24,13 @@ import resend
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, text, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, func, text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker, declarative_base
 from email_validator import validate_email, EmailNotValidError
 
 # Import your database models
 from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, ComputedStatistic, User
-from api.auth import router as auth_router
+from api.auth import router as auth_router, require_session
 from api.square import router as square_router
 
 
@@ -106,6 +106,19 @@ class LeadIpEvent(Base):
     id = Column(Integer, primary_key=True)
     ip = Column(String, nullable=False, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AlertSubscription(Base):
+    __tablename__ = "alert_subscriptions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    game = Column(String(50), nullable=False)
+    active = Column(Boolean, nullable=False, default=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "game", name="alert_sub_user_game_key"),
+    )
 
 
 def ensure_tables() -> None:
@@ -338,6 +351,81 @@ def send_day7_email(to_email: str):
         "reply_to": EMAIL_REPLY_TO,
         "subject": subject,
         "html": html,
+    })
+
+
+def send_draw_alert_email(to_email: str, game: str, draw, variance: dict):
+    """Send a draw-result alert email to a Pro subscriber."""
+    game_labels = {
+        "pick-3":   "Pick 3",
+        "pick-4":   "Pick 4",
+        "pick-5":   "Pick 5",
+        "fantasy-5":"Fantasy 5",
+        "cash-pop": "Cash Pop",
+    }
+    label = game_labels.get(game, game)
+    draw_date = draw.draw_datetime.astimezone(EASTERN_TZ).strftime("%B %d, %Y")
+
+    # Format draw numbers as large styled digits
+    digit_style = (
+        'display:inline-block;min-width:36px;text-align:center;'
+        'font-size:30px;font-weight:800;color:#111;'
+        'background:#f3f4f6;border-radius:8px;padding:6px 10px;margin:0 4px;'
+    )
+    if game == "cash-pop":
+        nums_html = f'<span style="{digit_style}">{draw.number}</span>'
+    elif game == "fantasy-5":
+        nums_html = "".join(f'<span style="{digit_style}">{n}</span>' for n in draw.numbers)
+    else:
+        digit_count = {"pick-3": 3, "pick-4": 4, "pick-5": 5}[game]
+        nums_html = "".join(
+            f'<span style="{digit_style}">{getattr(draw, f"digit_{i}")}</span>'
+            for i in range(1, digit_count + 1)
+        )
+
+    hot       = variance.get("hot_digit", "-")
+    hot_rate  = variance.get("hot_rate", "-")
+    cold      = variance.get("cold_digit", "-")
+    cold_rate = variance.get("cold_rate", "-")
+
+    html = f"""
+    {_email_header_logo_html()}
+    <p style="font-size:12px;color:#999;margin:0 0 4px;">Draw Alert &mdash; {draw_date}</p>
+    <h2 style="margin:0 0 20px;font-size:20px;">{label} Results</h2>
+    <div style="background:#f9fafb;border-radius:12px;padding:20px 16px;margin-bottom:20px;text-align:center;">
+      {nums_html}
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:10px 14px;background:#eff6ff;border-radius:8px 0 0 8px;color:#1d4ed8;font-weight:600;">
+          🔥 Hot digit (30d)
+        </td>
+        <td style="padding:10px 14px;background:#eff6ff;border-radius:0 8px 8px 0;font-weight:700;">
+          {hot} &nbsp;<span style="color:#888;font-weight:400;">({hot_rate})</span>
+        </td>
+      </tr>
+      <tr><td colspan="2" style="height:6px;"></td></tr>
+      <tr>
+        <td style="padding:10px 14px;background:#f5f3ff;border-radius:8px 0 0 8px;color:#7c3aed;font-weight:600;">
+          ❄️ Cold digit (30d)
+        </td>
+        <td style="padding:10px 14px;background:#f5f3ff;border-radius:0 8px 8px 0;font-weight:700;">
+          {cold} &nbsp;<span style="color:#888;font-weight:400;">({cold_rate})</span>
+        </td>
+      </tr>
+    </table>
+    <p style="font-size:12px;color:#999;">
+      Manage your alerts at
+      <a href="{PUBLIC_APP_URL}/dashboard/alerts" style="color:#2563eb;">{PUBLIC_APP_URL}/dashboard/alerts</a>
+    </p>
+    {_email_footer_html(to_email)}
+    """
+    return _resend_send({
+        "from":     EMAIL_FROM,
+        "to":       [to_email],
+        "reply_to": EMAIL_REPLY_TO,
+        "subject":  f"ProbLabs Alert: {label} results for {draw_date}",
+        "html":     html,
     })
 
 
@@ -717,6 +805,44 @@ def get_position_variance(game_name: str, period: str = "3m", db=Depends(get_db)
     }
 
 
+# =================================================
+# PRO — Draw Alert Subscriptions
+# =================================================
+
+@app.get("/api/v1/alerts/subscriptions")
+def get_alert_subscriptions(request: Request, db=Depends(get_db)):
+    """Return the list of games the authenticated Pro user is subscribed to."""
+    session = require_session(request)
+    user_id = int(session["sub"])
+    subs = db.query(AlertSubscription).filter_by(user_id=user_id).all()
+    return {"subscribed_games": [s.game for s in subs if s.active]}
+
+
+@app.put("/api/v1/alerts/subscriptions")
+async def update_alert_subscription(request: Request, db=Depends(get_db)):
+    """Enable or disable a draw alert for a specific game."""
+    session = require_session(request)
+    if not session.get("is_pro"):
+        raise HTTPException(status_code=403, detail="Pro subscription required.")
+    user_id = int(session["sub"])
+
+    body = await request.json()
+    game   = body.get("game", "")
+    active = bool(body.get("active", True))
+
+    if game not in SUPPORTED_GAMES:
+        raise HTTPException(status_code=400, detail=f"Invalid game '{game}'.")
+
+    sub = db.query(AlertSubscription).filter_by(user_id=user_id, game=game).first()
+    if sub:
+        sub.active = active
+    else:
+        sub = AlertSubscription(user_id=user_id, game=game, active=active)
+        db.add(sub)
+    db.commit()
+    return {"ok": True, "game": game, "active": active}
+
+
 @app.get("/unsubscribe")
 def unsubscribe(email: str, sig: str, db=Depends(get_db)):
     if not UNSUBSCRIBE_SECRET:
@@ -992,3 +1118,61 @@ def admin_export_leads_csv(db=Depends(get_db)):
 def run_nurture(db=Depends(get_db)):
     result = _run_nurture_batch(db, utcnow(), NURTURE_BATCH_LIMIT)
     return {"ok": True, "nurture": result}
+
+
+@app.post(f"/{ADMIN_PATH}/alerts/send", dependencies=[Depends(require_admin)])
+def admin_send_draw_alerts(game: str, db=Depends(get_db)):
+    """
+    Trigger draw-alert emails for a game to all active Pro subscribers.
+    Call this endpoint right after a new draw is ingested.
+    e.g. POST /admin/alerts/send?game=pick-3
+    """
+    if game not in SUPPORTED_GAMES:
+        raise HTTPException(status_code=400, detail=f"Invalid game '{game}'.")
+
+    model_map = {
+        "pick-3":    DrawPick3,
+        "pick-4":    DrawPick4,
+        "pick-5":    DrawPick5,
+        "fantasy-5": DrawFantasy5,
+        "cash-pop":  DrawCashPop,
+    }
+    model = model_map[game]
+
+    # Latest draw
+    latest = db.query(model).order_by(model.draw_datetime.desc()).first()
+    if not latest:
+        return {"ok": False, "detail": "No draw data found for this game."}
+
+    # Hot/cold variance (30-day)
+    stat = db.query(ComputedStatistic).filter(
+        ComputedStatistic.game_type == game,
+        ComputedStatistic.metric_name == "variance_30_day",
+    ).order_by(ComputedStatistic.computed_at.desc()).first()
+    variance = stat.metric_value if stat and stat.metric_value else {}
+
+    # Active subscribers
+    subs = db.query(AlertSubscription).filter_by(game=game, active=True).all()
+    if not subs:
+        return {"ok": True, "sent": 0, "errors": 0, "detail": "No active subscribers."}
+
+    user_ids = [s.user_id for s in subs]
+    users = (
+        db.query(User)
+        .filter(User.id.in_(user_ids), User.is_pro == True)  # noqa: E712
+        .all()
+    )
+
+    sent = 0
+    errors = 0
+    for user in users:
+        if is_unsubscribed(db, user.email):
+            continue
+        try:
+            send_draw_alert_email(user.email, game, latest, variance)
+            sent += 1
+        except Exception as ex:
+            errors += 1
+            print(f"[alert-error] email={user.email} err={ex}")
+
+    return {"ok": True, "sent": sent, "errors": errors}
