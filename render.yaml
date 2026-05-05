@@ -32,7 +32,7 @@ services:
     plan: starter
     schedule: "15 2 * * *"       # 02:15 UTC = 10:15 PM ET (after all draws settle)
     buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
-    startCommand: python engine/ingest_daily.py
+        startCommand: playwright install chromium && python engine/ingest_daily.py
     envVars:
       - key: DATABASE_URL
         sync: false          # same value as the web service
