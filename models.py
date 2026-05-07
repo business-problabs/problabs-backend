@@ -129,3 +129,8 @@ class User(Base):
     square_customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     square_subscription_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     subscription_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Admin-gifted Pro — set by the admin grant-pro endpoint, not by Square.
+    # When True, Square cancellation webhooks will NOT revoke Pro access.
+    pro_gifted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    pro_gifted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    pro_gifted_note: Mapped[Optional[str]] = mapped_column(String, nullable=True)

@@ -296,13 +296,13 @@ def send_day3_email(to_email: str):
     html = f"""
     {_email_header_logo_html()}
     <p>Hello,</p>
-    <p>You’ll notice something different about <strong>Probability AI Labs</strong>.</p>
+    <p>You'll notice something different about <strong>Probability AI Labs</strong>.</p>
     <p>
-      We don’t use hype.<br>
-      We don’t promise wins.<br>
-      And we don’t claim to “predict” lottery numbers.
+      We don't use hype.<br>
+      We don't promise wins.<br>
+      And we don't claim to "predict" lottery numbers.
     </p>
-    <p><strong>That’s intentional — and here’s why.</strong></p>
+    <p><strong>That's intentional — and here's why.</strong></p>
     <p>
       Every Florida Lottery draw is random by design.
       Math cannot change that — but it can explain how probability behaves over time.
@@ -330,7 +330,7 @@ def send_day7_email(to_email: str):
     {_email_header_logo_html()}
     <p>Hello,</p>
     <p>
-      Here’s how <strong>Probability AI Labs</strong> approaches Florida Lottery analysis.
+      Here's how <strong>Probability AI Labs</strong> approaches Florida Lottery analysis.
     </p>
     <p>
       We work exclusively with verified historical draw data.
@@ -553,12 +553,12 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
     latest_local = latest_draw.draw_datetime.astimezone(EASTERN_TZ)
     latest_date_start = latest_local.replace(hour=0, minute=0, second=0, microsecond=0)
     latest_date_end = latest_date_start + timedelta(days=1)
-    
+
     todays_draws = db.query(model).filter(
         model.draw_datetime >= latest_date_start,
         model.draw_datetime < latest_date_end
     ).order_by(model.draw_datetime.asc()).all()
-    
+
     draw_date = latest_local.strftime("%Y-%m-%d")
 
     # 5. Fetch the latest computed statistics for this game
@@ -591,13 +591,13 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
             if not draw.draw_datetime: continue
             hour = draw.draw_datetime.astimezone(EASTERN_TZ).hour
             digits = extract_digits(draw, game_name)
-            
+
             if hour < 11: draws_dict["morning"] = digits
             elif hour < 15: draws_dict["matinee"] = digits
             elif hour < 19: draws_dict["afternoon"] = digits
             elif hour < 22: draws_dict["evening"] = digits
             else: draws_dict["late_night"] = digits
-            
+
         response.update(draws_dict)
     else:
         draws_dict = {"midday": ["-"] * 5, "evening": ["-"] * 5}
@@ -605,10 +605,10 @@ def get_latest_results(game_name: str, db=Depends(get_db)):
             if not draw.draw_datetime: continue
             hour = draw.draw_datetime.astimezone(EASTERN_TZ).hour
             digits = extract_digits(draw, game_name)
-            
+
             if hour < 17: draws_dict["midday"] = digits
             else: draws_dict["evening"] = digits
-            
+
         response.update(draws_dict)
 
     return response
@@ -1176,3 +1176,149 @@ def admin_send_draw_alerts(game: str, db=Depends(get_db)):
             print(f"[alert-error] email={user.email} err={ex}")
 
     return {"ok": True, "sent": sent, "errors": errors}
+
+
+# =================================================
+# Admin — User Pro Gift Management
+# =================================================
+
+@app.get(f"/{ADMIN_PATH}/users", dependencies=[Depends(require_admin)])
+def admin_list_users(limit: int = 50, offset: int = 0, db=Depends(get_db)):
+    """
+    List all registered users with their Pro and gift status.
+    Supports ?limit=N&offset=N for pagination.
+    """
+    lim = max(1, min(int(limit), 500))
+    off = max(0, int(offset))
+    users = db.query(User).order_by(User.created_at.desc()).offset(off).limit(lim).all()
+    total = db.query(User).count()
+    now = utcnow()
+    return {
+        "ok": True,
+        "total": total,
+        "limit": lim,
+        "offset": off,
+        "items": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "is_pro": u.is_pro,
+                "effective_pro": u.is_pro and (
+                    u.subscription_ends_at is None or u.subscription_ends_at > now
+                ),
+                "pro_gifted": u.pro_gifted,
+                "pro_gifted_at": u.pro_gifted_at.isoformat() if u.pro_gifted_at else None,
+                "pro_gifted_note": u.pro_gifted_note,
+                "subscription_ends_at": u.subscription_ends_at.isoformat() if u.subscription_ends_at else None,
+                "square_subscription_id": u.square_subscription_id,
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+                "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+            }
+            for u in users
+        ],
+    }
+
+
+@app.post(f"/{ADMIN_PATH}/users/grant-pro", dependencies=[Depends(require_admin)])
+async def admin_grant_pro(request: Request, db=Depends(get_db)):
+    """
+    Admin: grant Pro tier to any user by email — no credit card required.
+
+    Body:
+      { "email": "user@example.com", "days": 30, "note": "reason" }
+
+    - Omit "days" or set it to null for permanent/indefinite access.
+    - "note" is optional — appears in GET /admin/users for your own reference.
+    - Creates the user account automatically if it does not exist yet.
+    """
+    body = await request.json()
+    email = normalize_email(body.get("email", ""))
+    days  = body.get("days")           # None -> permanent; int -> timed
+    note  = (body.get("note") or "").strip() or None
+
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required.")
+    try:
+        validate_email(email, check_deliverability=False)
+    except EmailNotValidError:
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    if days is not None:
+        try:
+            days = int(days)
+            if days <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="'days' must be a positive integer, or omit/null for permanent access.",
+            )
+
+    user = db.query(User).filter_by(email=email).first()
+    created = False
+    if not user:
+        user = User(email=email)
+        db.add(user)
+        db.flush()   # get user.id without committing
+        created = True
+
+    now = utcnow()
+    ends_at = (now + timedelta(days=days)) if days is not None else None
+
+    user.is_pro             = True
+    user.pro_gifted         = True
+    user.pro_gifted_at      = now
+    user.pro_gifted_note    = note
+    user.subscription_ends_at = ends_at   # None = indefinite
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "ok":                   True,
+        "user_created":         created,
+        "user_id":              user.id,
+        "email":                user.email,
+        "is_pro":               True,
+        "pro_gifted":           True,
+        "permanent":            ends_at is None,
+        "subscription_ends_at": ends_at.isoformat() if ends_at else None,
+        "note":                 note,
+    }
+
+
+@app.post(f"/{ADMIN_PATH}/users/revoke-pro", dependencies=[Depends(require_admin)])
+async def admin_revoke_pro(request: Request, db=Depends(get_db)):
+    """
+    Admin: revoke the admin-gifted Pro from a user by email.
+    Does NOT cancel any active Square subscription — only clears the gift flags.
+    If the user has no Square subscription either, is_pro is set to False.
+
+    Body: { "email": "user@example.com" }
+    """
+    body = await request.json()
+    email = normalize_email(body.get("email", ""))
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required.")
+
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No user found with email '{email}'.")
+
+    had_gift = user.pro_gifted
+    user.pro_gifted      = False
+    user.pro_gifted_at   = None
+    user.pro_gifted_note = None
+
+    # If there is no active Square subscription, also revoke Pro entirely.
+    if not user.square_subscription_id:
+        user.is_pro = False
+        user.subscription_ends_at = None
+
+    db.commit()
+
+    return {
+        "ok":                      True,
+        "email":                   user.email,
+        "gift_was_active":         had_gift,
+        "is_pro":                  user.is_pro,
+        "has_square_subscription": bool(user.square_subscription_id),
+    }

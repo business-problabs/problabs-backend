@@ -341,10 +341,14 @@ async def square_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                     user.subscription_ends_at = None  # active — no expiry
                     user.square_subscription_id = subscription_id
                 elif status in ("CANCELED", "DEACTIVATED", "PAUSED"):
-                    # Keep is_pro True with grace period from charged_through_date
-                    ends_at = _parse_square_date(charged_through_date)
-                    user.subscription_ends_at = ends_at
+                    # Always record the Square subscription ID.
                     user.square_subscription_id = subscription_id
+                    # Only apply a grace-period expiry if the user does NOT have
+                    # an admin-gifted Pro — we never want a Square cancel to
+                    # revoke access that was manually granted by the admin.
+                    if not user.pro_gifted:
+                        ends_at = _parse_square_date(charged_through_date)
+                        user.subscription_ends_at = ends_at
                 await db.commit()
 
     # ── Subscription canceled ───────────────────────────────────────────────
@@ -358,9 +362,11 @@ async def square_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 select(User).where(User.square_subscription_id == subscription_id)
             )
             user = result.scalar_one_or_none()
-            if user:
+            # Only apply grace-period expiry if the user does NOT have an
+            # admin-gifted Pro — preserve manually granted access.
+            if user and not user.pro_gifted:
                 ends_at = _parse_square_date(charged_through_date)
-                # Grace period: access continues until end of billing period
+                # Grace period: access continues until end of billing period.
                 user.subscription_ends_at = ends_at
                 # is_pro stays True; /auth/me computes effective access via ends_at
                 await db.commit()
