@@ -1322,3 +1322,37 @@ async def admin_revoke_pro(request: Request, db=Depends(get_db)):
         "is_pro":                  user.is_pro,
         "has_square_subscription": bool(user.square_subscription_id),
     }
+
+
+@app.post(f"/{ADMIN_PATH}/users/force-revoke-pro", dependencies=[Depends(require_admin)])
+async def admin_force_revoke_pro(request: Request, db=Depends(get_db)):
+    """
+    Admin: force-revoke Pro from any user regardless of Square subscription status.
+    Clears all pro flags and subscription_ends_at immediately.
+
+    Body: { "email": "user@example.com" }
+    """
+    body = await request.json()
+    email = normalize_email(body.get("email", ""))
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required.")
+
+    user = db.query(User).filter_by(email=email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"No user found with email '{email}'.")
+
+    user.is_pro              = False
+    user.pro_gifted          = False
+    user.pro_gifted_at       = None
+    user.pro_gifted_note     = None
+    user.subscription_ends_at = None
+
+    db.commit()
+
+    return {
+        "ok":                    True,
+        "email":                 user.email,
+        "is_pro":                user.is_pro,
+        "pro_gifted":            user.pro_gifted,
+        "square_subscription_id": user.square_subscription_id,
+    }
