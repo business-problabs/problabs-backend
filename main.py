@@ -628,11 +628,14 @@ PERIOD_DAYS = {
 }
 
 @app.get("/api/v1/results/{game_name}/variance")
-def get_historical_variance(game_name: str, period: str = "30d", db=Depends(get_db)):
+def get_historical_variance(game_name: str, period: str = "30d", request: Request = None, db=Depends(get_db)):
     """
     Pro endpoint: returns hot/cold variance for a given game and time period.
     period options: 30d, 3m, 6m, 1y, all
     """
+    session = require_session(request)
+    if not session.get("is_pro"):
+        raise HTTPException(status_code=403, detail="Pro subscription required.")
     if game_name not in SUPPORTED_GAMES:
         raise HTTPException(status_code=404, detail="Game not found.")
 
@@ -721,11 +724,14 @@ def get_historical_variance(game_name: str, period: str = "30d", db=Depends(get_
 # Pro endpoint: returns per-position digit frequency for Pick 3/4/5.
 # Fantasy 5 and Cash Pop return a 422 (not applicable).
 @app.get("/api/v1/results/{game_name}/position-variance")
-def get_position_variance(game_name: str, period: str = "3m", db=Depends(get_db)):
+def get_position_variance(game_name: str, period: str = "3m", request: Request = None, db=Depends(get_db)):
     """
     Returns digit frequency broken down by position.
     Supported games: pick-3, pick-4, pick-5.
     """
+    session = require_session(request)
+    if not session.get("is_pro"):
+        raise HTTPException(status_code=403, detail="Pro subscription required.")
     POSITIONAL_GAMES = {
         "pick-3": (DrawPick3, 3),
         "pick-4": (DrawPick4, 4),
