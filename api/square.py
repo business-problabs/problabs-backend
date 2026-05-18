@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 import base64
@@ -15,6 +16,7 @@ from db import SessionLocal
 from models import User
 
 router = APIRouter(prefix="/square", tags=["square"])
+logger = logging.getLogger(__name__)
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -141,19 +143,9 @@ async def create_checkout(request: Request, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email required")
 
     if SQUARE_SUBSCRIPTION_PLAN_ID:
-        # Recurring subscription checkout
+        # Recurring subscription checkout — no order block, plan defines pricing
         payload = {
             "idempotency_key": str(uuid.uuid4()),
-            "order": {
-                "location_id": SQUARE_LOCATION_ID,
-                "line_items": [
-                    {
-                        "name": "ProbLabs Pro",
-                        "quantity": "1",
-                        "base_price_money": {"amount": 999, "currency": "USD"},
-                    }
-                ],
-            },
             "checkout_options": {
                 "redirect_url": f"{PUBLIC_APP_URL}/dashboard?upgraded=true",
                 "ask_for_shipping_address": False,
@@ -190,6 +182,7 @@ async def create_checkout(request: Request, db: AsyncSession = Depends(get_db)):
         )
 
     if resp.status_code != 200:
+        logger.error("Square checkout error %s: %s", resp.status_code, resp.text)
         raise HTTPException(status_code=502, detail=f"Square error: {resp.text}")
 
     data = resp.json()
