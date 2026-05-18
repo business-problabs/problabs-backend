@@ -143,9 +143,16 @@ async def create_checkout(request: Request, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email required")
 
     if SQUARE_SUBSCRIPTION_PLAN_ID:
-        # Recurring subscription checkout — no order block, plan defines pricing
+        # Recurring subscription checkout.
+        # quick_pay provides the required location/item context;
+        # subscription_plan_id converts the link into a recurring subscription.
         payload = {
             "idempotency_key": str(uuid.uuid4()),
+            "quick_pay": {
+                "name": "ProbLabs Pro",
+                "price_money": {"amount": 999, "currency": "USD"},
+                "location_id": SQUARE_LOCATION_ID,
+            },
             "checkout_options": {
                 "redirect_url": f"{PUBLIC_APP_URL}/dashboard?upgraded=true",
                 "ask_for_shipping_address": False,
