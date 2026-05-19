@@ -23,6 +23,27 @@ services:
         sync: false
       - key: ENABLE_NURTURE_EMAILS
         value: "true"
+      # Social media posting credentials
+      - key: X_CONSUMER_KEY
+        sync: false
+      - key: X_CONSUMER_SECRET
+        sync: false
+      - key: X_ACCESS_TOKEN
+        sync: false
+      - key: X_ACCESS_TOKEN_SECRET
+        sync: false
+      - key: REDDIT_CLIENT_ID
+        sync: false
+      - key: REDDIT_CLIENT_SECRET
+        sync: false
+      - key: REDDIT_USERNAME
+        sync: false
+      - key: REDDIT_PASSWORD
+        sync: false
+      - key: FACEBOOK_PAGE_ID
+        sync: false
+      - key: FACEBOOK_PAGE_TOKEN
+        sync: false
 
   # ── Daily Lottery Ingest Cron Job ──────────────────────────────────────────
   # Runs at 10:15 PM ET (02:15 UTC next day) — after the last Cash Pop draw.
