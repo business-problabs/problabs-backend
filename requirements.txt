@@ -24,3 +24,9 @@ resend==2.4.0
 beautifulsoup4==4.12.3
 playwright
 PyJWT==2.9.0
+
+# Social Media Scheduler
+Pillow>=10.0
+APScheduler>=3.10
+tweepy>=4.14
+praw>=7.7
