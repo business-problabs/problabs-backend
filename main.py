@@ -32,6 +32,7 @@ from email_validator import validate_email, EmailNotValidError
 from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, ComputedStatistic, User
 from api.auth import router as auth_router, require_session
 from api.square import router as square_router
+from api.social import router as social_router, start_scheduler, stop_scheduler, ensure_social_table
 
 
 # =================================================
@@ -160,11 +161,19 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(square_router)
+app.include_router(social_router)
 
 
 @app.on_event("startup")
 def _startup():
     ensure_tables()
+    ensure_social_table()
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    stop_scheduler()
 
 
 # =================================================
