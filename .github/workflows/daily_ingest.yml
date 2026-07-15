@@ -1,4 +1,4 @@
-# Maintenance: Re-enabled July 2026
+#Dependencies-Maintenance Maintenance: Re-enabled July 2026
 name: Florida Lottery Daily Ingest
 
 on:
@@ -22,7 +22,7 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
 
-      - name: Install Dependencies# Maintenance: Re-enabled July 2026
+      - name: Install Dependencies
       # Maintenance: Re-enabled July 2026
     
         run: |
