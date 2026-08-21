@@ -33,6 +33,7 @@ from models import DrawPick3, DrawPick4, DrawPick5, DrawFantasy5, DrawCashPop, C
 from api.auth import router as auth_router, require_session
 from api.square import router as square_router
 from api.social import router as social_router, start_scheduler, stop_scheduler, ensure_social_table
+from api.pro import router as pro_router
 
 
 # =================================================
@@ -162,6 +163,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(square_router)
 app.include_router(social_router)
+app.include_router(pro_router)
 
 
 @app.on_event("startup")
